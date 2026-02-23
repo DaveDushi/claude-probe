@@ -20,21 +20,63 @@
 
   <main id="sessions-main">
     <div class="sessions-toolbar">
-      <div class="sessions-count" id="sessions-count">Loading...</div>
-      <button class="btn btn-small" id="refresh-btn" title="Refresh">Refresh</button>
+      <div class="sessions-toolbar-top">
+        <div class="search-box">
+          <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input type="text" id="search-input" placeholder="Search sessions..." autocomplete="off" spellcheck="false">
+        </div>
+        <div class="toolbar-actions">
+          <select id="sort-select" class="sort-select">
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+            <option value="expensive">Most expensive</option>
+            <option value="longest">Longest duration</option>
+            <option value="most-tools">Most tool calls</option>
+          </select>
+          <button class="btn btn-small" id="refresh-btn" title="Refresh">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="sessions-toolbar-bottom">
+        <div class="filter-chips">
+          <button class="filter-chip-btn active" data-filter="all">All</button>
+          <button class="filter-chip-btn" data-filter="active">Active</button>
+          <button class="filter-chip-btn" data-filter="completed">Completed</button>
+          <button class="filter-chip-btn" data-filter="error">Errors</button>
+        </div>
+        <div class="sessions-count" id="sessions-count"></div>
+      </div>
     </div>
 
-    <div id="sessions-list" class="sessions-list">
-      <div class="loading">Loading sessions...</div>
-    </div>
+    <div id="sessions-list" class="sessions-list"></div>
 
     <div id="empty-state" class="empty-state hidden">
-      <div class="empty-icon">&#9776;</div>
+      <div class="empty-icon-wrap">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      </div>
       <h3>No sessions yet</h3>
       <p>Pipe Claude Code output to start logging:</p>
       <pre class="code-block">claude -p "prompt" --output-format stream-json --verbose | node probe.js</pre>
     </div>
+
+    <div id="no-match-state" class="empty-state hidden">
+      <h3>No matching sessions</h3>
+      <p>Try adjusting your search or filters.</p>
+    </div>
   </main>
+
+  <!-- Delete confirmation dialog -->
+  <div id="delete-dialog" class="dialog-overlay hidden">
+    <div class="dialog-box">
+      <h3>Delete session?</h3>
+      <p id="delete-dialog-msg">This will permanently remove the session log file.</p>
+      <div class="dialog-actions">
+        <button class="btn" id="delete-cancel">Cancel</button>
+        <button class="btn btn-danger" id="delete-confirm">Delete</button>
+      </div>
+    </div>
+  </div>
 
   <script src="sessions.js"></script>
 </body>
