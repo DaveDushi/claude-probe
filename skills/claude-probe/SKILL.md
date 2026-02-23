@@ -130,6 +130,75 @@ All commands are also available via HTTP for scripts and agent orchestration:
 | `--no-browser` | Don't auto-open the dashboard |
 | `--claude-path <path>` | Custom path to the claude binary |
 
+## Workflow: Plan, Execute, Verify
+
+Always follow this three-phase workflow when using claude-probe. This produces dramatically better results than jumping straight into execution.
+
+### Phase 1: Plan
+
+Before spawning any session, think through:
+
+1. **What needs to happen?** Break the task into discrete, testable steps.
+2. **What order?** Identify dependencies between steps. Independent steps can run in parallel.
+3. **What could go wrong?** Anticipate failure modes and how you'll detect them.
+4. **What does success look like?** Define concrete verification criteria for each step.
+
+Write your plan out explicitly. For example:
+
+```
+Plan:
+1. Read the current auth module to understand the structure
+2. Fix the token refresh race condition in auth.py
+3. Add unit tests covering the race condition
+4. Run the test suite to verify nothing broke
+Verification: all tests pass, token refresh works under concurrent requests
+```
+
+### Phase 2: Execute
+
+Now spawn sessions to carry out each step. Craft prompts that are specific and scoped:
+
+```bash
+# Bad — vague, no guardrails
+probe new -p "Fix auth" --cwd ./project --auto-approve
+
+# Good — specific, scoped, with constraints
+probe new -p "In auth.py, the token refresh at line 84 has a race condition when multiple requests hit refresh simultaneously. Add a lock so only one refresh executes at a time. Do not change the public API." --cwd ./project --auto-approve
+```
+
+Monitor progress as sessions run:
+
+```bash
+probe status <session-id>
+probe events <session-id> --last 5
+```
+
+### Phase 3: Verify
+
+Never trust that a session did the right thing. Always verify:
+
+1. **Read the result** — check what the session actually did.
+   ```bash
+   probe result <session-id>
+   ```
+
+2. **Run tests** — spawn a verification session if needed.
+   ```bash
+   probe new -p "Run the full test suite and report any failures" --cwd ./project --auto-approve
+   ```
+
+3. **Diff the changes** — check that nothing unexpected was modified.
+   ```bash
+   probe new -p "Run git diff and summarize all changes made" --cwd ./project --auto-approve
+   ```
+
+4. **Fix issues** — if verification fails, diagnose and send a follow-up or spawn a new session.
+   ```bash
+   probe send <session-id> -p "The tests in test_auth.py are failing with TimeoutError. Fix the lock implementation."
+   ```
+
+Only move on when verification passes. If it doesn't, loop back: re-plan, re-execute, re-verify.
+
 ## Examples
 
 Spawn a session and wait for the result:
