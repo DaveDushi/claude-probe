@@ -97,7 +97,8 @@
       (s.model || '').toLowerCase().includes(q) ||
       (s.claudeSessionId || '').toLowerCase().includes(q) ||
       (s.id || '').toLowerCase().includes(q) ||
-      (s.preview || '').toLowerCase().includes(q)
+      (s.preview || '').toLowerCase().includes(q) ||
+      (s.cwd || '').toLowerCase().includes(q)
     );
   }
 
@@ -142,6 +143,16 @@
     // Short session ID
     const shortId = (s.claudeSessionId || s.id || '').slice(0, 12);
 
+    // Working directory — show just the last 2 path segments
+    let cwdHtml = '';
+    if (s.cwd) {
+      const parts = s.cwd.replace(/\\/g, '/').split('/').filter(Boolean);
+      const short = parts.length > 2 ? '.../' + parts.slice(-2).join('/') : s.cwd;
+      cwdHtml = `<span class="session-cwd" title="${escapeHtml(s.cwd)}">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        ${escapeHtml(short)}</span>`;
+    }
+
     return `
       <div class="session-card ${statusClass}" data-id="${escapeHtml(s.id)}">
         <a href="/index.html?session=${encodeURIComponent(s.id)}" class="session-card-link">
@@ -167,6 +178,7 @@
           </div>
           <div class="session-footer">
             <span class="session-id" title="${escapeHtml(s.claudeSessionId || s.id)}">${escapeHtml(shortId)}</span>
+            ${cwdHtml}
           </div>
         </a>
         <button class="session-delete-btn" data-id="${escapeHtml(s.id)}" title="Delete session">

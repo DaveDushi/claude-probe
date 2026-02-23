@@ -27,6 +27,7 @@
   const statDuration = document.getElementById('stat-duration');
   const statTurns = document.getElementById('stat-turns');
   const toolsList = document.getElementById('tools-list');
+  const cwdBadge = document.getElementById('cwd-badge');
 
   // Filters
   const filters = {
@@ -241,6 +242,14 @@
       if (event.cacheRead) usage.cacheRead += event.cacheRead;
       updateStats();
       return; // Don't render usage events as cards
+    }
+
+    if (kind === 'session_start') {
+      if (event.cwd && cwdBadge) {
+        cwdBadge.textContent = event.cwd;
+        cwdBadge.title = event.cwd;
+      }
+      return; // Don't render as a card
     }
 
     if (kind === 'init') {
@@ -609,6 +618,12 @@
         return res.json();
       })
       .then(data => {
+        // Set cwd from API response if available
+        if (data.cwd && cwdBadge) {
+          cwdBadge.textContent = data.cwd;
+          cwdBadge.title = data.cwd;
+        }
+
         for (const evt of data.events) {
           seenEventIds.add(evt.id);
           handleEvent(evt);

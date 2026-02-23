@@ -811,12 +811,33 @@ body.sessions-page {
   margin-top: 8px;
   padding-top: 8px;
   border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .session-id {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text-muted);
+}
+
+.session-cwd {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 250px;
+}
+.session-cwd svg {
+  flex-shrink: 0;
+  opacity: 0.6;
 }
 
 /* Delete button */
