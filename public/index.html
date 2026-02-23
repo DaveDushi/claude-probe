@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Probe</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="header">
+    <div class="header-left">
+      <h1>CLAUDE PROBE</h1>
+      <span id="status-dot" class="status-dot disconnected"></span>
+      <span id="status-text" class="status-text">Connecting...</span>
+    </div>
+    <div class="header-right">
+      <span id="model-badge" class="badge"></span>
+      <span id="session-badge" class="badge dim"></span>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="timeline-container">
+      <div id="timeline"></div>
+      <button id="jump-bottom" class="jump-btn hidden" title="Jump to bottom">&#8595; Latest</button>
+    </section>
+
+    <aside id="sidebar">
+      <div class="panel">
+        <h2>Token Usage</h2>
+        <div class="stat-row">
+          <span class="stat-label">Input</span>
+          <span id="stat-input" class="stat-value">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Output</span>
+          <span id="stat-output" class="stat-value">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Cache created</span>
+          <span id="stat-cache-create" class="stat-value">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Cache read</span>
+          <span id="stat-cache-read" class="stat-value">0</span>
+        </div>
+        <hr>
+        <div class="stat-row">
+          <span class="stat-label">Cost</span>
+          <span id="stat-cost" class="stat-value">$0.00</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Duration</span>
+          <span id="stat-duration" class="stat-value">--</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Turns</span>
+          <span id="stat-turns" class="stat-value">--</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Filters</h2>
+        <label class="filter-row">
+          <input type="checkbox" id="filter-text" checked>
+          <span class="filter-chip text-chip">TEXT</span>
+          Text responses
+        </label>
+        <label class="filter-row">
+          <input type="checkbox" id="filter-tool" checked>
+          <span class="filter-chip tool-chip">TOOL</span>
+          Tool calls
+        </label>
+        <label class="filter-row">
+          <input type="checkbox" id="filter-thinking" checked>
+          <span class="filter-chip think-chip">THINK</span>
+          Thinking blocks
+        </label>
+        <label class="filter-row">
+          <input type="checkbox" id="filter-result" checked>
+          <span class="filter-chip result-chip">RESULT</span>
+          Tool results
+        </label>
+        <label class="filter-row">
+          <input type="checkbox" id="filter-system" checked>
+          <span class="filter-chip system-chip">SYS</span>
+          System events
+        </label>
+      </div>
+
+      <div class="panel">
+        <h2>Tools Used</h2>
+        <div id="tools-list" class="tools-list">
+          <span class="dim">None yet</span>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
