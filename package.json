@@ -13,5 +13,27 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DaveDushi/claude-probe.git"
+  },
+  "homepage": "https://github.com/DaveDushi/claude-probe",
+  "bugs": {
+    "url": "https://github.com/DaveDushi/claude-probe/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "ai",
+    "agent",
+    "session-management",
+    "dashboard",
+    "cli",
+    "monitoring"
+  ],
+  "author": "DaveDushi",
+  "engines": {
+    "node": ">=18"
+  }
 }

@@ -1,2 +1,7 @@
 node_modules/
 sessions/
+tasks/
+*.log
+.DS_Store
+Thumbs.db
+.env
