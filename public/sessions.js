@@ -241,25 +241,31 @@
   }
 
   // --- Load sessions ---
+  let firstLoad = true;
   async function loadSessions() {
-    // Show skeleton
-    sessionsList.classList.remove('hidden');
-    emptyState.classList.add('hidden');
-    noMatchState.classList.add('hidden');
-    sessionsList.innerHTML = Array(3).fill(0).map(() => `
-      <div class="session-card skeleton">
-        <div class="skeleton-line w60"></div>
-        <div class="skeleton-line w90"></div>
-        <div class="skeleton-line w40"></div>
-      </div>
-    `).join('');
+    // Only show skeleton on first load to avoid flicker on live updates
+    if (firstLoad) {
+      sessionsList.classList.remove('hidden');
+      emptyState.classList.add('hidden');
+      noMatchState.classList.add('hidden');
+      sessionsList.innerHTML = Array(3).fill(0).map(() => `
+        <div class="session-card skeleton">
+          <div class="skeleton-line w60"></div>
+          <div class="skeleton-line w90"></div>
+          <div class="skeleton-line w40"></div>
+        </div>
+      `).join('');
+    }
 
     try {
       const res = await fetch('/api/sessions');
       allSessions = await res.json();
+      firstLoad = false;
       render();
     } catch (err) {
-      sessionsList.innerHTML = `<div class="error-msg">Failed to load sessions: ${escapeHtml(err.message)}</div>`;
+      if (firstLoad) {
+        sessionsList.innerHTML = `<div class="error-msg">Failed to load sessions: ${escapeHtml(err.message)}</div>`;
+      }
     }
   }
 
@@ -325,6 +331,57 @@
     }
   });
 
+  // --- Live updates via WebSocket + polling fallback ---
+  let refreshDebounce = null;
+  let wsConnected = false;
+
+  function scheduleRefresh(delayMs = 500) {
+    if (refreshDebounce) clearTimeout(refreshDebounce);
+    refreshDebounce = setTimeout(() => {
+      refreshDebounce = null;
+      loadSessions();
+    }, delayMs);
+  }
+
+  function connectWs() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}`);
+
+    ws.onopen = () => {
+      wsConnected = true;
+    };
+
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        // Refresh on ANY event from the server — new session data is flowing
+        if (msg.type === 'event' || msg.type === 'snapshot') {
+          scheduleRefresh();
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    ws.onclose = () => {
+      wsConnected = false;
+      setTimeout(connectWs, 3000);
+    };
+
+    ws.onerror = () => ws.close();
+  }
+
+  // Polling fallback: check periodically for new sessions
+  let pollTimer = null;
+  function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+      loadSessions();
+    }, wsConnected ? 30000 : 5000);
+  }
+  startPolling();
+
   // --- Init ---
   loadSessions();
+  connectWs();
 })();

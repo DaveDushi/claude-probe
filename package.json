@@ -1,13 +1,14 @@
 {
   "name": "claude-probe",
-  "version": "1.0.0",
-  "description": "Real-time dashboard for monitoring Claude Code sessions",
+  "version": "2.0.0",
+  "description": "CLI + dashboard for controlling and monitoring Claude Code sessions",
   "main": "probe.js",
   "bin": {
-    "claude-probe": "./probe.js"
+    "claude-probe": "./probe.js",
+    "probe": "./probe.js"
   },
   "scripts": {
-    "start": "node probe.js"
+    "start": "node probe.js serve"
   },
   "dependencies": {
     "ws": "^8.18.0"

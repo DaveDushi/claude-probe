@@ -597,9 +597,11 @@
   const savedSessionId = urlParams.get('session');
 
   if (savedSessionId) {
-    // Load a saved session from the API instead of connecting via WebSocket
-    statusDot.className = 'status-dot ended';
-    statusText.textContent = 'Loading saved session...';
+    // Load existing events, then connect WS for live updates
+    statusDot.className = 'status-dot connected';
+    statusText.textContent = 'Loading session...';
+
+    const seenEventIds = new Set();
 
     fetch(`/api/sessions/${encodeURIComponent(savedSessionId)}`)
       .then(res => {
@@ -607,11 +609,62 @@
         return res.json();
       })
       .then(data => {
-        statusText.textContent = 'Saved session';
         for (const evt of data.events) {
+          seenEventIds.add(evt.id);
           handleEvent(evt);
         }
-        sessionEnded = true;
+
+        // If session is still active, connect WS for live updates
+        const isActive = data.status && data.status !== 'done' && data.status !== 'error';
+        if (isActive) {
+          statusText.textContent = `Live — ${data.status}`;
+          statusDot.className = 'status-dot streaming';
+        } else {
+          statusText.textContent = 'Session complete';
+          sessionEnded = true;
+        }
+
+        // Always connect WS to catch late events and status changes
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const liveWs = new WebSocket(`${proto}//${location.host}`);
+        liveWs.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+
+          // Only process events for this session
+          if (msg.type === 'event' && msg.sessionId === savedSessionId) {
+            if (!seenEventIds.has(msg.data.id)) {
+              seenEventIds.add(msg.data.id);
+              handleEvent(msg.data);
+            }
+          }
+
+          // Session status updates
+          if (msg.type === 'session_status' && msg.sessionId === savedSessionId) {
+            if (msg.status === 'done' || msg.status === 'error') {
+              sessionEnded = true;
+              statusDot.className = 'status-dot ended';
+              statusText.textContent = 'Session complete';
+            } else if (msg.status === 'waiting_approval') {
+              statusDot.className = 'status-dot connected';
+              statusText.textContent = 'Awaiting approval';
+            } else if (msg.status === 'running') {
+              statusDot.className = 'status-dot streaming';
+              statusText.textContent = 'Streaming';
+            } else if (msg.status === 'idle') {
+              statusDot.className = 'status-dot connected';
+              statusText.textContent = 'Idle — waiting for input';
+            }
+          }
+
+          // Snapshot — ignore for session-specific view
+          if (msg.type === 'snapshot') return;
+        };
+        liveWs.onclose = () => {
+          if (!sessionEnded) {
+            statusText.textContent += ' (disconnected)';
+          }
+        };
       })
       .catch(err => {
         statusText.textContent = `Error: ${err.message}`;

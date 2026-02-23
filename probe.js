@@ -1,166 +1,467 @@
 #!/usr/bin/env node
 
-const readline = require('node:readline');
 const path = require('node:path');
 const http = require('node:http');
 const { exec } = require('node:child_process');
 
 const args = process.argv.slice(2);
-const isSendMode = args.includes('send');
 
-// Parse flags
+// Parse --port flag (global, works with any command)
 let port = 3456;
 const portIdx = args.indexOf('--port');
 if (portIdx !== -1 && args[portIdx + 1]) {
   port = parseInt(args[portIdx + 1], 10);
+  args.splice(portIdx, 2);
 }
 
-// ============================================================
-// SEND MODE: lightweight stdin → POST to running server
-// Usage: claude ... | node probe.js send [--port 3456]
-// ============================================================
-if (isSendMode) {
-  const baseUrl = `http://localhost:${port}`;
-  const connectionId = `conn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+const command = args[0] || 'serve';
+const BASE = `http://localhost:${port}`;
 
-  function post(urlPath, body, headers = {}) {
-    return new Promise((resolve, reject) => {
-      const url = new URL(urlPath, baseUrl);
-      const req = http.request({
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'text/plain',
-          'X-Connection-Id': connectionId,
-          ...headers,
-        },
-      }, (res) => {
-        let data = '';
-        res.on('data', c => data += c);
-        res.on('end', () => resolve({ status: res.statusCode, data }));
+// ================================================================
+// HTTP helpers
+// ================================================================
+
+function httpGet(urlPath) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlPath, BASE);
+    http.get({ hostname: url.hostname, port: url.port, path: url.pathname + url.search }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, data }); }
       });
-      req.on('error', reject);
-      req.write(body);
-      req.end();
+    }).on('error', (err) => {
+      if (err.code === 'ECONNREFUSED') {
+        process.stderr.write(`probe: Server not running on port ${port}. Start with: probe serve\n`);
+        process.exit(1);
+      }
+      reject(err);
     });
-  }
+  });
+}
 
-  // Check if server is running via health endpoint
-  async function checkServer() {
-    return new Promise((resolve, reject) => {
-      const url = new URL('/api/health', baseUrl);
-      const req = http.get({ hostname: url.hostname, port: url.port, path: url.pathname }, (res) => {
-        res.resume(); // drain
-        resolve();
-      });
-      req.on('error', (err) => {
-        if (err.code === 'ECONNREFUSED') {
-          process.stderr.write(`\nclaude-probe: Server not running on port ${port}.\n`);
-          process.stderr.write(`Start it first:  node probe.js [--port ${port}]\n\n`);
-          process.exit(1);
-        }
-        reject(err);
+function httpPost(urlPath, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlPath, BASE);
+    const payload = typeof body === 'string' ? body : JSON.stringify(body);
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, data }); }
       });
     });
-  }
-
-  async function main() {
-    await checkServer();
-    process.stderr.write(`claude-probe: Sending to localhost:${port}\n`);
-
-    const rl = readline.createInterface({ input: process.stdin, terminal: false });
-
-    // Sequential send queue — guarantees ordering, limits concurrency to 1
-    const queue = [];
-    let sending = false;
-    let lineCount = 0;
-    let stdinClosed = false;
-    let closeResolve = null;
-
-    async function drain() {
-      if (sending) return;
-      sending = true;
-      while (queue.length > 0) {
-        const line = queue.shift();
-        try {
-          await post('/api/ingest', line);
-        } catch {
-          // Server went away mid-stream, keep draining to unblock close
-        }
+    req.on('error', (err) => {
+      if (err.code === 'ECONNREFUSED') {
+        process.stderr.write(`probe: Server not running on port ${port}. Start with: probe serve\n`);
+        process.exit(1);
       }
-      sending = false;
-      // If stdin is closed and queue is empty, resolve the close promise
-      if (stdinClosed && queue.length === 0 && closeResolve) {
-        closeResolve();
-      }
-    }
-
-    rl.on('line', (line) => {
-      process.stdout.write(line + '\n');
-      queue.push(line);
-      lineCount++;
-      drain();
+      reject(err);
     });
+    req.write(payload);
+    req.end();
+  });
+}
 
-    rl.on('close', async () => {
-      stdinClosed = true;
-      // Wait for queue to fully drain
-      if (queue.length > 0 || sending) {
-        await new Promise(r => { closeResolve = r; });
-      }
-      try {
-        const res = await post('/api/ingest/close', '');
-        const result = JSON.parse(res.data);
-        process.stderr.write(`claude-probe: Session saved as ${result.sessionId} (${lineCount} lines)\n`);
-      } catch {
-        process.stderr.write(`claude-probe: Session closed (${lineCount} lines)\n`);
-      }
-      process.exit(0);
+function httpDelete(urlPath) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlPath, BASE);
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'DELETE',
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, data }); }
+      });
     });
-  }
+    req.on('error', reject);
+    req.end();
+  });
+}
 
-  main();
+// ================================================================
+// CLI helpers
+// ================================================================
 
-// ============================================================
-// SERVE MODE: persistent server (default)
-// Usage: node probe.js [--port 3456] [--no-browser]
-// ============================================================
-} else {
+function getFlag(flag, argList) {
+  argList = argList || args;
+  const idx = argList.indexOf(flag);
+  if (idx !== -1 && argList[idx + 1]) return argList[idx + 1];
+  return null;
+}
+
+function hasFlag(flag, argList) {
+  return (argList || args).includes(flag);
+}
+
+function formatDuration(ms) {
+  if (!ms) return '-';
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function formatCost(usd) {
+  if (!usd) return '-';
+  return `$${usd.toFixed(4)}`;
+}
+
+function truncate(str, len) {
+  if (!str) return '';
+  str = str.replace(/\n/g, ' ').trim();
+  return str.length > len ? str.slice(0, len) + '...' : str;
+}
+
+// ================================================================
+// Commands
+// ================================================================
+
+async function cmdServe() {
   const { SessionStore } = require('./lib/store');
   const { createServer } = require('./lib/server');
 
   let dataDir = path.join(__dirname, 'sessions');
-  const dataDirIdx = args.indexOf('--data-dir');
-  if (dataDirIdx !== -1 && args[dataDirIdx + 1]) {
-    dataDir = path.resolve(args[dataDirIdx + 1]);
+  const dataDirFlag = getFlag('--data-dir');
+  if (dataDirFlag) dataDir = path.resolve(dataDirFlag);
+
+  const noBrowser = hasFlag('--no-browser');
+  const publicDir = path.join(__dirname, 'public');
+  const claudePath = getFlag('--claude-path');
+  const store = new SessionStore(dataDir);
+  const server = createServer(port, publicDir, store, { claudePath });
+
+  await server.start();
+  const url = `http://localhost:${port}`;
+  const sessionCount = store.listSessions().length;
+
+  process.stderr.write(`\nprobe server running: ${url}\n`);
+  process.stderr.write(`sessions: ${dataDir} (${sessionCount} saved)\n\n`);
+
+  if (!noBrowser) {
+    const target = sessionCount > 0 ? `${url}/sessions.html` : url;
+    if (process.platform === 'win32') exec(`start ${target}`);
+    else if (process.platform === 'darwin') exec(`open ${target}`);
+    else exec(`xdg-open ${target}`);
+  }
+}
+
+async function cmdNew() {
+  const prompt = getFlag('-p') || getFlag('--prompt');
+  if (!prompt) {
+    process.stderr.write('probe new: -p "prompt" required\n');
+    process.exit(1);
   }
 
-  const noBrowser = args.includes('--no-browser');
-  const publicDir = path.join(__dirname, 'public');
-  const store = new SessionStore(dataDir);
-  const server = createServer(port, publicDir, store);
+  const body = { prompt };
+  const model = getFlag('--model');
+  if (model) body.model = model;
+  if (hasFlag('--auto-approve')) body.autoApprove = true;
+  const cwd = getFlag('--cwd');
+  if (cwd) body.cwd = path.resolve(cwd);
+  const resume = getFlag('-r') || getFlag('--resume');
+  if (resume) body.resumeSessionId = resume;
+  // Collect passthrough flags for Claude CLI
+  const flags = [];
+  const permMode = getFlag('--permission-mode');
+  if (permMode) flags.push('--permission-mode', permMode);
+  const allowedTools = getFlag('--allowedTools') || getFlag('--allowed-tools');
+  if (allowedTools) flags.push('--allowedTools', allowedTools);
+  if (flags.length) body.flags = flags;
 
-  server.start().then(() => {
-    const url = `http://localhost:${port}`;
-    const sessionCount = store.listSessions().length;
+  const res = await httpPost('/api/sessions', body);
+  if (res.status !== 200) {
+    process.stderr.write(`probe new: ${res.data.error || 'failed'}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`${res.data.sessionId}\n`);
+}
 
-    process.stderr.write(`\nclaude-probe server running: ${url}\n`);
-    process.stderr.write(`Sessions: ${dataDir} (${sessionCount} saved)\n`);
-    process.stderr.write(`\nTo send sessions:\n`);
-    process.stderr.write(`  claude -p "prompt" --output-format stream-json --verbose | node probe.js send\n\n`);
+async function cmdStatus() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe status: session ID required\n'); process.exit(1); }
 
-    if (!noBrowser) {
-      const target = sessionCount > 0 ? `${url}/sessions.html` : url;
-      const platform = process.platform;
-      if (platform === 'win32') {
-        exec(`start ${target}`);
-      } else if (platform === 'darwin') {
-        exec(`open ${target}`);
-      } else {
-        exec(`xdg-open ${target}`);
-      }
+  const res = await httpGet(`/api/sessions/${id}/status`);
+  if (res.status !== 200) {
+    process.stderr.write(`probe status: ${res.data.error || 'not found'}\n`);
+    process.exit(1);
+  }
+
+  const s = res.data;
+  let line = `status: ${s.status}`;
+  if (s.model) line += ` | model: ${s.model}`;
+  if (s.toolCalls) line += ` | tools: ${s.toolCalls}`;
+  if (s.costUsd) line += ` | cost: ${formatCost(s.costUsd)}`;
+  if (s.eventCount) line += ` | events: ${s.eventCount}`;
+  process.stdout.write(line + '\n');
+
+  if (s.pendingApproval) {
+    const a = s.pendingApproval;
+    let detail = `awaiting: ${a.toolName}`;
+    if (a.input) {
+      const inputStr = typeof a.input === 'string' ? a.input : JSON.stringify(a.input);
+      detail += ` ${truncate(inputStr, 120)}`;
     }
-  });
+    process.stdout.write(detail + '\n');
+  }
+
+  if (s.error) {
+    process.stdout.write(`error: ${s.error}\n`);
+  }
+}
+
+async function cmdEvents() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe events: session ID required\n'); process.exit(1); }
+
+  const last = getFlag('--last') || '20';
+  const res = await httpGet(`/api/sessions/${id}/events?last=${last}`);
+  if (res.status !== 200) {
+    process.stderr.write(`probe events: ${res.data.error || 'not found'}\n`);
+    process.exit(1);
+  }
+
+  const events = res.data.events || [];
+  for (const e of events) {
+    const time = new Date(e.ts).toLocaleTimeString('en-US', { hour12: false });
+    let line = `[${time}] `;
+
+    switch (e.kind) {
+      case 'init':
+        line += `init model=${e.model}`;
+        break;
+      case 'text':
+        line += `text: ${truncate(e.text, 120)}`;
+        break;
+      case 'text_delta':
+        continue; // skip deltas in summary view
+      case 'tool_call':
+        line += `tool: ${e.toolName} ${truncate(typeof e.input === 'string' ? e.input : JSON.stringify(e.input), 100)}`;
+        break;
+      case 'tool_result':
+        line += `result: ${truncate(e.content, 100)}${e.isError ? ' [ERROR]' : ''}`;
+        break;
+      case 'thinking':
+        line += `thinking: ${truncate(e.text, 80)}`;
+        break;
+      case 'approval_request':
+        line += `APPROVAL NEEDED: ${e.toolName} ${truncate(typeof e.input === 'string' ? e.input : JSON.stringify(e.input), 100)}`;
+        break;
+      case 'session_end':
+        line += `end: ${e.isError ? 'ERROR' : 'ok'} cost=${formatCost(e.costUsd)} turns=${e.numTurns}`;
+        break;
+      case 'session_complete':
+        line += `complete (${formatDuration(e.durationMs)})`;
+        break;
+      case 'session_resumed':
+        line += `resumed`;
+        break;
+      case 'block_start':
+        if (e.blockType === 'tool_use') {
+          line += `tool_start: ${e.toolName}`;
+        } else {
+          continue; // skip text/thinking block_start
+        }
+        break;
+      default:
+        continue; // skip noisy events
+    }
+
+    process.stdout.write(line + '\n');
+  }
+}
+
+async function cmdSend() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe send: session ID required\n'); process.exit(1); }
+
+  const prompt = getFlag('-p') || getFlag('--prompt');
+  if (!prompt) { process.stderr.write('probe send: -p "prompt" required\n'); process.exit(1); }
+
+  const res = await httpPost(`/api/sessions/${id}/message`, { prompt });
+  if (res.status !== 200) {
+    process.stderr.write(`probe send: ${res.data.error || 'failed'}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`sent (${res.data.status})\n`);
+}
+
+async function cmdApprove() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe approve: session ID required\n'); process.exit(1); }
+
+  const res = await httpPost(`/api/sessions/${id}/approve`, {});
+  if (res.status !== 200) {
+    process.stderr.write(`probe approve: ${res.data.error || 'failed'}\n`);
+    process.exit(1);
+  }
+  process.stdout.write('approved\n');
+}
+
+async function cmdDeny() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe deny: session ID required\n'); process.exit(1); }
+
+  const message = getFlag('-m') || getFlag('--message') || '';
+  const res = await httpPost(`/api/sessions/${id}/deny`, { message });
+  if (res.status !== 200) {
+    process.stderr.write(`probe deny: ${res.data.error || 'failed'}\n`);
+    process.exit(1);
+  }
+  process.stdout.write('denied\n');
+}
+
+async function cmdClose() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe close: session ID required\n'); process.exit(1); }
+
+  const res = await httpPost(`/api/sessions/${id}/close`, {});
+  if (res.status !== 200) {
+    process.stderr.write(`probe close: ${res.data.error || 'failed'}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`closed${res.data.wasActive ? '' : ' (was already done)'}\n`);
+}
+
+async function cmdResult() {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe result: session ID required\n'); process.exit(1); }
+
+  const res = await httpGet(`/api/sessions/${id}/result`);
+  if (res.status !== 200) {
+    process.stderr.write(`probe result: ${res.data.error || 'not found'}\n`);
+    process.exit(1);
+  }
+
+  if (res.data.result) {
+    process.stdout.write(res.data.result + '\n');
+  } else if (res.data.status && res.data.status !== 'done') {
+    process.stdout.write(`(session still ${res.data.status})\n`);
+  } else {
+    process.stdout.write('(no result)\n');
+  }
+}
+
+async function cmdSessions() {
+  const res = await httpGet('/api/sessions');
+  if (res.status !== 200) {
+    process.stderr.write('probe sessions: failed to list\n');
+    process.exit(1);
+  }
+
+  const sessions = res.data || [];
+  if (sessions.length === 0) {
+    process.stdout.write('no sessions\n');
+    return;
+  }
+
+  for (const s of sessions) {
+    let line = `${s.id}`;
+    if (s.status) line += ` [${s.status}]`;
+    else if (s.ended) line += ' [done]';
+    if (s.model) line += ` ${s.model}`;
+    if (s.costUsd) line += ` ${formatCost(s.costUsd)}`;
+    if (s.toolCalls) line += ` ${s.toolCalls}tools`;
+    if (s.preview) line += ` "${truncate(s.preview, 60)}"`;
+    process.stdout.write(line + '\n');
+  }
+}
+
+function printUsage() {
+  process.stderr.write(`
+claude-probe - control Claude Code sessions
+
+Commands:
+  serve                         Start the server + dashboard
+  new -p "prompt" [opts]        Create session (returns ID)
+  status <id>                   Get session status
+  events <id> [--last N]        Get recent events
+  send <id> -p "prompt"         Send follow-up message
+  close <id>                    Close session (kill process, keep data)
+  approve <id>                  Approve pending tool use
+  deny <id> [-m "reason"]       Deny pending tool use
+  result <id>                   Get final result text
+  sessions                      List all sessions
+
+Options for 'new':
+  --model <model>               Claude model to use
+  --auto-approve                Auto-approve all tool use
+  --cwd <dir>                   Working directory
+  -r, --resume <session-id>     Resume a Claude session
+
+Global:
+  --port <port>                 Server port (default: 3456)
+
+`);
+}
+
+// ================================================================
+// Dispatch
+// ================================================================
+
+switch (command) {
+  case 'serve':
+  case 'start':
+    cmdServe();
+    break;
+  case 'new':
+  case 'create':
+    cmdNew();
+    break;
+  case 'status':
+    cmdStatus();
+    break;
+  case 'events':
+  case 'log':
+    cmdEvents();
+    break;
+  case 'send':
+  case 'message':
+    cmdSend();
+    break;
+  case 'close':
+  case 'stop':
+    cmdClose();
+    break;
+  case 'approve':
+    cmdApprove();
+    break;
+  case 'deny':
+    cmdDeny();
+    break;
+  case 'result':
+    cmdResult();
+    break;
+  case 'sessions':
+  case 'list':
+  case 'ls':
+    cmdSessions();
+    break;
+  case 'help':
+  case '--help':
+  case '-h':
+    printUsage();
+    break;
+  default:
+    // No args → serve
+    if (!command || command.startsWith('-')) {
+      cmdServe();
+    } else {
+      process.stderr.write(`probe: unknown command '${command}'\n`);
+      printUsage();
+      process.exit(1);
+    }
 }
