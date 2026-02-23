@@ -511,6 +511,19 @@
       return;
     }
 
+    if (kind === 'session_resumed') {
+      statusDot.className = 'status-dot streaming';
+      statusText.textContent = 'Resumed';
+
+      const { card } = createCard(kind, event.ts, {
+        badge: 'RESUME', badgeClass: 'system',
+        title: 'Session resumed',
+      });
+      timeline.appendChild(card);
+      scrollToBottom();
+      return;
+    }
+
     if (kind === 'raw') {
       const { card, body } = createCard(kind, event.ts, {
         badge: 'RAW', badgeClass: 'system',
@@ -579,5 +592,32 @@
     };
   }
 
-  connect();
+  // --- Check for saved session mode (?session=id) ---
+  const urlParams = new URLSearchParams(window.location.search);
+  const savedSessionId = urlParams.get('session');
+
+  if (savedSessionId) {
+    // Load a saved session from the API instead of connecting via WebSocket
+    statusDot.className = 'status-dot ended';
+    statusText.textContent = 'Loading saved session...';
+
+    fetch(`/api/sessions/${encodeURIComponent(savedSessionId)}`)
+      .then(res => {
+        if (!res.ok) throw new Error('Session not found');
+        return res.json();
+      })
+      .then(data => {
+        statusText.textContent = 'Saved session';
+        for (const evt of data.events) {
+          handleEvent(evt);
+        }
+        sessionEnded = true;
+      })
+      .catch(err => {
+        statusText.textContent = `Error: ${err.message}`;
+      });
+  } else {
+    // Live mode — connect via WebSocket
+    connect();
+  }
 })();

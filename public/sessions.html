@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Probe - Sessions</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="sessions-page">
+  <header id="header">
+    <div class="header-left">
+      <h1>CLAUDE PROBE</h1>
+      <span class="header-sep">/</span>
+      <span class="header-subtitle">Sessions</span>
+    </div>
+    <div class="header-right">
+      <a href="/" class="nav-link">Live Dashboard</a>
+    </div>
+  </header>
+
+  <main id="sessions-main">
+    <div class="sessions-toolbar">
+      <div class="sessions-count" id="sessions-count">Loading...</div>
+      <button class="btn btn-small" id="refresh-btn" title="Refresh">Refresh</button>
+    </div>
+
+    <div id="sessions-list" class="sessions-list">
+      <div class="loading">Loading sessions...</div>
+    </div>
+
+    <div id="empty-state" class="empty-state hidden">
+      <div class="empty-icon">&#9776;</div>
+      <h3>No sessions yet</h3>
+      <p>Pipe Claude Code output to start logging:</p>
+      <pre class="code-block">claude -p "prompt" --output-format stream-json --verbose | node probe.js</pre>
+    </div>
+  </main>
+
+  <script src="sessions.js"></script>
+</body>
+</html>
