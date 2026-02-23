@@ -180,6 +180,7 @@ async function cmdNew() {
   if (permMode) flags.push('--permission-mode', permMode);
   const allowedTools = getFlag('--allowedTools') || getFlag('--allowed-tools');
   if (allowedTools) flags.push('--allowedTools', allowedTools);
+  if (hasFlag('--dangerously-skip-permissions')) flags.push('--dangerously-skip-permissions');
   if (flags.length) body.flags = flags;
 
   const res = await httpPost('/api/sessions', body);
