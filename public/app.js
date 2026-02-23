@@ -688,4 +688,16 @@
     // Live mode — connect via WebSocket
     connect();
   }
+
+  // Sidebar toggle for mobile
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const sidebar = document.getElementById('sidebar');
+  if (sidebarToggle && sidebar) {
+    sidebarToggle.addEventListener('click', () => {
+      sidebar.classList.toggle('open');
+    });
+    document.getElementById('timeline-container').addEventListener('click', () => {
+      sidebar.classList.remove('open');
+    });
+  }
 })();

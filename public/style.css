@@ -982,3 +982,237 @@ body.sessions-page {
 .hidden {
   display: none !important;
 }
+
+/* ===== Sidebar toggle button (hidden on desktop) ===== */
+.sidebar-toggle {
+  display: none;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: 16px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-family: var(--sans);
+  line-height: 1;
+}
+
+.sidebar-toggle:hover {
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
+/* ===== Responsive: Tablet & Mobile (≤768px) ===== */
+@media (max-width: 768px) {
+
+  /* -- Header -- */
+  header {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+
+  .header-right .badge {
+    display: none;
+  }
+
+  .sidebar-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* -- Live dashboard layout -- */
+  main {
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  #timeline-container {
+    padding: 12px;
+    min-height: 0;
+    flex: 1;
+  }
+
+  #sidebar {
+    display: none;
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    padding: 12px;
+    max-height: 50vh;
+    overflow-y: auto;
+  }
+
+  #sidebar.open {
+    display: block;
+  }
+
+  /* -- Event cards -- */
+  .event-header {
+    padding: 8px 10px;
+    flex-wrap: wrap;
+  }
+
+  .event-body {
+    padding: 0 10px 8px 10px;
+  }
+
+  .code-block {
+    font-size: 11px;
+    padding: 8px 10px;
+  }
+
+  /* -- Sessions page -- */
+  .sessions-page #sessions-main {
+    padding: 12px;
+  }
+
+  .sessions-toolbar-top {
+    flex-direction: column;
+  }
+
+  .toolbar-actions {
+    width: 100%;
+  }
+
+  .sort-select {
+    flex: 1;
+  }
+
+  .sessions-toolbar-bottom {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .filter-chips {
+    flex-wrap: wrap;
+  }
+
+  .session-stats {
+    gap: 8px;
+  }
+
+  .session-cwd {
+    max-width: 100%;
+  }
+
+  .session-card-link {
+    padding: 12px;
+  }
+
+  /* -- Touch-friendly tap targets -- */
+  .filter-chip-btn {
+    min-height: 36px;
+    padding: 6px 14px;
+  }
+
+  .filter-row {
+    padding: 8px 0;
+  }
+
+  .btn {
+    min-height: 36px;
+  }
+
+  .nav-link {
+    padding: 6px 12px;
+  }
+
+  .expand-btn {
+    padding: 6px 0;
+    font-size: 12px;
+  }
+
+  /* -- Delete button always visible on touch -- */
+  .session-delete-btn {
+    opacity: 1;
+  }
+
+  /* -- Dialog responsive -- */
+  .dialog-box {
+    margin: 16px;
+    max-width: calc(100vw - 32px);
+  }
+}
+
+/* ===== Responsive: Small phones (≤480px) ===== */
+@media (max-width: 480px) {
+
+  header {
+    padding: 6px 10px;
+    height: 44px;
+  }
+
+  .header-left h1 {
+    font-size: 12px;
+    letter-spacing: 1.5px;
+  }
+
+  main {
+    height: calc(100vh - 44px);
+  }
+
+  .sessions-page #sessions-main {
+    height: calc(100vh - 44px);
+    padding: 10px;
+  }
+
+  .event-card {
+    margin-bottom: 6px;
+  }
+
+  .event-header {
+    font-size: 11px;
+    gap: 6px;
+  }
+
+  .event-badge {
+    font-size: 9px;
+    padding: 1px 5px;
+  }
+
+  .text-content,
+  .thinking-content {
+    font-size: 12px;
+  }
+
+  .code-block {
+    font-size: 10px;
+    max-height: 200px;
+  }
+
+  .session-card-link {
+    padding: 10px;
+  }
+
+  .session-model {
+    font-size: 10px;
+  }
+
+  .session-preview {
+    font-size: 12px;
+  }
+
+  .session-stat {
+    font-size: 11px;
+  }
+
+  .session-footer {
+    font-size: 10px;
+  }
+
+  .empty-state {
+    padding: 40px 16px;
+  }
+
+  .empty-state .code-block {
+    font-size: 10px;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .search-box input {
+    font-size: 14px; /* prevents iOS zoom on focus */
+  }
+}
