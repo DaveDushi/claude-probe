@@ -202,15 +202,23 @@ async function cmdStatus() {
 
   const s = res.data;
   let line = `status: ${s.status}`;
+  if (s.phase && s.phase !== s.status) line += ` (${s.phase})`;
   if (s.model) line += ` | model: ${s.model}`;
   if (s.toolCalls) line += ` | tools: ${s.toolCalls}`;
   if (s.costUsd) line += ` | cost: ${formatCost(s.costUsd)}`;
   if (s.eventCount) line += ` | events: ${s.eventCount}`;
   process.stdout.write(line + '\n');
 
+  if (s.stuckForMs && s.stuckForMs > 30000) {
+    process.stdout.write(`warning: no activity for ${formatDuration(s.stuckForMs)}\n`);
+  }
+
   if (s.pendingApproval) {
     const a = s.pendingApproval;
     let detail = `awaiting: ${a.toolName}`;
+    if (a.requestedAt) {
+      detail += ` (waiting ${formatDuration(Date.now() - a.requestedAt)})`;
+    }
     if (a.input) {
       const inputStr = typeof a.input === 'string' ? a.input : JSON.stringify(a.input);
       detail += ` ${truncate(inputStr, 120)}`;
@@ -219,7 +227,8 @@ async function cmdStatus() {
   }
 
   if (s.error) {
-    process.stdout.write(`error: ${s.error}\n`);
+    const errLine = s.errorCode ? `error [${s.errorCode}]: ${s.error}` : `error: ${s.error}`;
+    process.stdout.write(errLine + '\n');
   }
 }
 
@@ -259,6 +268,15 @@ async function cmdEvents() {
         break;
       case 'approval_request':
         line += `APPROVAL NEEDED: ${e.toolName} ${truncate(typeof e.input === 'string' ? e.input : JSON.stringify(e.input), 100)}`;
+        break;
+      case 'approval_granted':
+        line += `APPROVED: ${e.toolName}`;
+        break;
+      case 'approval_denied':
+        line += `DENIED: ${e.toolName}${e.message ? ` (${e.message})` : ''}`;
+        break;
+      case 'session_timeout':
+        line += `TIMEOUT: ${e.reason} — ${e.message}`;
         break;
       case 'session_end':
         line += `end: ${e.isError ? 'ERROR' : 'ok'} cost=${formatCost(e.costUsd)} turns=${e.numTurns}`;
@@ -336,6 +354,15 @@ async function cmdClose() {
   process.stdout.write(`closed${res.data.wasActive ? '' : ' (was already done)'}\n`);
 }
 
+async function cmdShutdown() {
+  const res = await httpPost('/api/shutdown', {});
+  if (res.status !== 200) {
+    process.stderr.write(`probe shutdown: ${res.data.error || 'failed'}\n`);
+    process.exit(1);
+  }
+  process.stdout.write('server stopped\n');
+}
+
 async function cmdResult() {
   const id = args[1];
   if (!id) { process.stderr.write('probe result: session ID required\n'); process.exit(1); }
@@ -380,6 +407,73 @@ async function cmdSessions() {
   }
 }
 
+async function cmdDoctor() {
+  // Step 1: Check server reachability
+  let healthOk = false;
+  try {
+    const health = await httpGet('/api/health');
+    healthOk = health.status === 200 && health.data.ok;
+    process.stdout.write(`server: ${healthOk ? 'OK' : 'UNHEALTHY'} (port ${port})\n`);
+    process.stdout.write(`  active sessions: ${health.data.activeSessions}\n`);
+  } catch (err) {
+    process.stdout.write(`server: UNREACHABLE (port ${port})\n`);
+    process.stdout.write(`  ${err.message}\n`);
+    process.exit(1);
+  }
+
+  // Step 2: Detailed diagnostics
+  try {
+    const diag = await httpGet('/api/diagnostics');
+    if (diag.status === 200) {
+      const d = diag.data;
+      process.stdout.write(`  uptime: ${formatDuration(d.serverUptime * 1000)}\n`);
+      process.stdout.write(`  dashboard clients: ${d.dashboardClients}\n`);
+      process.stdout.write(`  watchdog tracking: ${d.watchdogTracking}\n`);
+
+      if (d.sessions && d.sessions.length > 0) {
+        process.stdout.write(`\nsessions:\n`);
+        for (const s of d.sessions) {
+          let line = `  ${s.sessionId} [${s.status}]`;
+          line += ` proc=${s.processAlive ? 'alive' : 'dead'}`;
+          line += ` ws=${s.wsConnected ? 'connected' : 'disconnected'}`;
+          line += ` events=${s.eventCount}`;
+          if (s.stuckForMs && s.stuckForMs > 10000) {
+            line += ` stuck=${formatDuration(s.stuckForMs)}`;
+          }
+          if (s.error) line += ` error="${s.error}"`;
+          process.stdout.write(line + '\n');
+        }
+      }
+    }
+  } catch {
+    process.stdout.write('  (diagnostics endpoint not available)\n');
+  }
+
+  // Step 3: Quick WebSocket test
+  try {
+    const WebSocket = require('ws');
+    await new Promise((resolve, reject) => {
+      const testWs = new WebSocket(`ws://localhost:${port}`);
+      const timer = setTimeout(() => {
+        testWs.close();
+        reject(new Error('timeout'));
+      }, 5000);
+      testWs.on('open', () => {
+        clearTimeout(timer);
+        testWs.close();
+        resolve();
+      });
+      testWs.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    process.stdout.write(`websocket: OK\n`);
+  } catch (err) {
+    process.stdout.write(`websocket: FAILED (${err.message})\n`);
+  }
+}
+
 function printUsage() {
   process.stderr.write(`
 claude-probe - control Claude Code sessions
@@ -391,10 +485,12 @@ Commands:
   events <id> [--last N]        Get recent events
   send <id> -p "prompt"         Send follow-up message
   close <id>                    Close session (kill process, keep data)
+  shutdown                      Stop the server and free the port
   approve <id>                  Approve pending tool use
   deny <id> [-m "reason"]       Deny pending tool use
   result <id>                   Get final result text
   sessions                      List all sessions
+  doctor                        Server/session health diagnostics
 
 Options for 'new':
   --model <model>               Claude model to use
@@ -433,8 +529,11 @@ switch (command) {
     cmdSend();
     break;
   case 'close':
-  case 'stop':
     cmdClose();
+    break;
+  case 'shutdown':
+  case 'stop':
+    cmdShutdown();
     break;
   case 'approve':
     cmdApprove();
@@ -449,6 +548,10 @@ switch (command) {
   case 'list':
   case 'ls':
     cmdSessions();
+    break;
+  case 'doctor':
+  case 'diag':
+    cmdDoctor();
     break;
   case 'help':
   case '--help':

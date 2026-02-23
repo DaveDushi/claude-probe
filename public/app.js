@@ -533,6 +533,45 @@
       return;
     }
 
+    if (kind === 'approval_granted') {
+      const { card } = createCard(kind, event.ts, {
+        badge: 'APPROVED', badgeClass: 'system',
+        title: `Approved: ${event.toolName}`,
+      });
+      timeline.appendChild(card);
+      scrollToBottom();
+      return;
+    }
+
+    if (kind === 'approval_denied') {
+      const { card, body } = createCard(kind, event.ts, {
+        badge: 'DENIED', badgeClass: 'error',
+        title: `Denied: ${event.toolName}`,
+      });
+      if (event.message) {
+        const content = document.createElement('div');
+        content.className = 'text-content';
+        content.textContent = event.message;
+        body.appendChild(content);
+      }
+      timeline.appendChild(card);
+      scrollToBottom();
+      return;
+    }
+
+    if (kind === 'session_timeout') {
+      const { card } = createCard(kind, event.ts, {
+        badge: 'TIMEOUT', badgeClass: 'error',
+        title: event.message || 'Session timed out',
+      });
+      timeline.appendChild(card);
+      statusDot.className = 'status-dot ended';
+      statusText.textContent = 'Timed out';
+      sessionEnded = true;
+      scrollToBottom();
+      return;
+    }
+
     if (kind === 'raw') {
       const { card, body } = createCard(kind, event.ts, {
         badge: 'RAW', badgeClass: 'system',
