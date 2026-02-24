@@ -7,6 +7,10 @@ import { parseLine } from './parser';
 import { SessionState, ProbeEvent, SessionSnapshot } from './state';
 import { SessionWatchdog } from './watchdog';
 import { SessionStore } from './store';
+import {
+  SessionLimits, GlobalLimits, DEFAULT_GLOBAL_LIMITS, DEFAULT_SESSION_LIMITS,
+  checkSessionLimits, checkConcurrency, CircuitBreaker,
+} from './limits';
 
 // ================================================================
 // Types
@@ -38,6 +42,7 @@ export interface Session {
   prompt: string | null;
   model: string | undefined;
   cwd: string;
+  limits: SessionLimits;
 }
 
 interface CreateSessionOpts {
@@ -47,6 +52,7 @@ interface CreateSessionOpts {
   autoApprove?: boolean;
   cwd?: string;
   passthroughFlags?: string[];
+  limits?: Partial<SessionLimits>;
 }
 
 interface IngestContext {
@@ -56,6 +62,7 @@ interface IngestContext {
 
 export interface ServerOptions {
   claudePath?: string;
+  limits?: Partial<GlobalLimits>;
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -86,12 +93,16 @@ function findClaudeBinary(): string {
 
 export function createServer(port: number, publicDir: string, store: SessionStore, opts?: ServerOptions) {
   const claudeBinary = opts?.claudePath || findClaudeBinary();
+  const globalLimits: GlobalLimits = { ...DEFAULT_GLOBAL_LIMITS, ...opts?.limits };
 
   // --- Dashboard WebSocket clients (browsers) ---
   const dashboardClients = new Set<WebSocket>();
 
   // --- Active sessions: sessionId → session object ---
   const activeSessions = new Map<string, Session>();
+
+  // --- Circuit breaker for spawn failures ---
+  const circuitBreaker = new CircuitBreaker();
 
   // --- Session watchdog (timeout detection) ---
   const watchdog = new SessionWatchdog();
@@ -125,6 +136,48 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     }
   };
 
+  // --- Idle timeout: session auto-closes after no new prompts ---
+  watchdog.onIdleExpired = (sessionId: string) => {
+    const session = activeSessions.get(sessionId);
+    if (!session || session.status !== 'idle') return;
+
+    session.status = 'done';
+    const idleEvent: ProbeEvent = {
+      id: `evt_${Date.now()}_idle_done`,
+      ts: Date.now(),
+      kind: 'session_complete',
+      reason: 'idle_timeout',
+      durationMs: Date.now() - session.state.startTime,
+    };
+    session.state.addEvent(idleEvent);
+    store.appendEvent(session.sessionId, idleEvent);
+    broadcastToDashboard(idleEvent, session.sessionId);
+    broadcastSessionStatus(session);
+
+    if (session.process) {
+      try { session.process.kill(); } catch { /* ignore */ }
+    }
+    if (session.ws) {
+      try { session.ws.close(); } catch { /* ignore */ }
+    }
+  };
+
+  // --- GC: remove done/error sessions from memory after delay ---
+  const GC_INTERVAL_MS = 60_000;
+  const GC_DELAY_MS = 60_000;
+  const gcTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of activeSessions) {
+      if (session.status !== 'done' && session.status !== 'error') continue;
+      // Keep in memory for GC_DELAY_MS after terminal state
+      const lastEvent = session.state.events[session.state.events.length - 1];
+      if (lastEvent && now - lastEvent.ts > GC_DELAY_MS) {
+        activeSessions.delete(id);
+      }
+    }
+  }, GC_INTERVAL_MS);
+  gcTimer.unref(); // don't keep process alive for GC
+
   // --- Legacy ingest support (pipe mode) ---
   const ingestSessions = new Map<string, IngestContext>();
   let activeConnectionId: string | null = null;
@@ -135,8 +188,27 @@ export function createServer(port: number, publicDir: string, store: SessionStor
   // ================================================================
 
   function createSession(opts: CreateSessionOpts): string {
+    // --- Guard: circuit breaker ---
+    if (circuitBreaker.isOpen()) {
+      throw new Error('Circuit breaker open: too many recent spawn failures. Try again shortly.');
+    }
+
+    // --- Guard: concurrency limit ---
+    const activeCount = [...activeSessions.values()].filter(s => s.status !== 'done' && s.status !== 'error').length;
+    const concCheck = checkConcurrency(activeCount, globalLimits.maxConcurrentSessions);
+    if (concCheck.exceeded) {
+      throw new Error(concCheck.reason!);
+    }
+
     const { prompt, model, resumeSessionId, autoApprove, cwd, passthroughFlags } = opts;
     const sessionId = store.generateSessionId();
+    const sessionLimits: SessionLimits = {
+      ...DEFAULT_SESSION_LIMITS,
+      maxCostUsd: globalLimits.maxCostUsd,
+      maxTurns: globalLimits.maxTurns,
+      maxDurationMs: globalLimits.maxDurationMs,
+      ...opts.limits,
+    };
 
     const session: Session = {
       sessionId,
@@ -155,6 +227,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       prompt,
       model,
       cwd: cwd || process.cwd(),
+      limits: sessionLimits,
     };
 
     activeSessions.set(sessionId, session);
@@ -214,6 +287,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
 
     child.on('error', (err: Error) => {
       watchdog.untrack(session.sessionId);
+      circuitBreaker.recordFailure();
       session.status = 'error';
       session.errorCode = 'spawn_error';
       session.error = `Failed to spawn claude: ${err.message}`;
@@ -251,6 +325,43 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     return true;
   }
 
+  /** Check limits and kill session if exceeded. Returns true if session was killed. */
+  function enforceLimits(session: Session): boolean {
+    if (session.status === 'done' || session.status === 'error') return false;
+    const check = checkSessionLimits(
+      session.state.usage,
+      session.state.turns,
+      session.state.startTime,
+      session.limits,
+    );
+    if (!check.exceeded) return false;
+
+    session.status = 'error';
+    session.error = check.reason;
+    session.errorCode = check.code;
+
+    const limitEvent: ProbeEvent = {
+      id: `evt_${Date.now()}_limit`,
+      ts: Date.now(),
+      kind: 'limit_exceeded',
+      reason: check.reason,
+      code: check.code,
+    };
+    session.state.addEvent(limitEvent);
+    store.appendEvent(session.sessionId, limitEvent);
+    broadcastToDashboard(limitEvent, session.sessionId);
+    broadcastSessionStatus(session);
+
+    if (session.process) {
+      try { session.process.kill(); } catch { /* ignore */ }
+    }
+    if (session.ws) {
+      try { session.ws.close(); } catch { /* ignore */ }
+    }
+    watchdog.untrack(session.sessionId);
+    return true;
+  }
+
   function sendPromptToSession(session: Session, prompt: string): void {
     if (!session.ws || session.ws.readyState !== WebSocket.OPEN) {
       session.promptQueue.push(prompt);
@@ -267,6 +378,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       emitUserMessage(session, prompt);
       session.status = 'running';
       session.gotResult = false;
+      watchdog.trackRunning(session.sessionId);
       broadcastSessionStatus(session);
     } else {
       session.promptQueue.push(prompt);
@@ -534,6 +646,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
         activeSessions: activeSessions.size,
         dashboardClients: dashboardClients.size,
         watchdogTracking: watchdog.timers.size,
+        circuitBreaker: circuitBreaker.getStatus(),
+        globalLimits,
         sessions,
       });
       return;
@@ -563,6 +677,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           autoApprove: body.autoApprove || false,
           cwd: body.cwd,
           passthroughFlags: body.flags,
+          limits: body.limits,
         });
         json(res, 200, { sessionId });
       } catch (err: unknown) {
@@ -667,6 +782,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
             ? Date.now() - session.lastActivityAt
             : null,
           startedAt: s.startTime,
+          turns: session.state.turns,
+          limits: session.limits,
         };
         if (session.pendingApproval) {
           result.pendingApproval = session.pendingApproval;
@@ -954,6 +1071,10 @@ export function createServer(port: number, publicDir: string, store: SessionStor
         if (session && events.length > 0) {
           session.lastActivityAt = Date.now();
           watchdog.trackActivity(session.sessionId);
+          // Circuit breaker: first real event = successful start
+          circuitBreaker.recordSuccess();
+          // Enforce limits after each batch of events
+          if (enforceLimits(session)) continue;
         }
 
         // --- Track session state ---
@@ -968,10 +1089,13 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           }
 
           if (obj.type === 'result') {
+            session.state.turns++;
             session.status = 'idle';
+            watchdog.trackIdle(session.sessionId);
             broadcastSessionStatus(session);
 
-            if (session.promptQueue.length > 0) {
+            // Check limits after turn completes
+            if (!enforceLimits(session) && session.promptQueue.length > 0) {
               setTimeout(() => {
                 if (session!.status === 'idle' && session!.promptQueue.length > 0) {
                   const nextPrompt = session!.promptQueue.shift()!;

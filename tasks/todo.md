@@ -1,39 +1,61 @@
-# JS → TS Migration (Backend Only)
+# Production Readiness — Incremental PRs
 
-## Plan
+## PR Order
+1. **Lifecycle + Guardrails** (items 1 + 6) ← current
+2. Permissions + Approval UX (items 3 + 4)
+3. Observability + Artifacts (items 2 + 7)
+4. Recovery + Test harness (items 5 + 8) — stretch
 
-Convert 6 backend JS files to TypeScript. Frontend (public/) stays vanilla JS.
+---
 
-### Files to convert
-- `probe.js` → `src/probe.ts` (571 lines, CLI entry point)
-- `lib/parser.js` → `src/lib/parser.ts` (232 lines)
-- `lib/server.js` → `src/lib/server.ts` (1006 lines)
-- `lib/state.js` → `src/lib/state.ts` (112 lines)
-- `lib/store.js` → `src/lib/store.ts` (176 lines)
-- `lib/watchdog.js` → `src/lib/watchdog.ts` (112 lines)
+## PR 1: Deterministic Lifecycle + Operational Controls
 
-### Steps
+### 1A. Deterministic session lifecycle
 
-- [ ] 1. Setup: tsconfig.json, add `typescript` + `@types/ws` + `@types/node` devDeps
-- [ ] 2. Create `src/` dir, convert `lib/state.js` → `src/lib/state.ts` (simplest, no deps)
-- [ ] 3. Convert `lib/watchdog.js` → `src/lib/watchdog.ts` (simple, no deps)
-- [ ] 4. Convert `lib/parser.js` → `src/lib/parser.ts` (standalone)
-- [ ] 5. Convert `lib/store.js` → `src/lib/store.ts` (fs only)
-- [ ] 6. Convert `lib/server.js` → `src/lib/server.ts` (biggest, depends on all above + ws)
-- [ ] 7. Convert `probe.js` → `src/probe.ts` (CLI entry, depends on server + store)
-- [ ] 8. Update package.json: bin→dist/, scripts (build, start, dev), engine
-- [ ] 9. Update .gitignore: add `dist/`
-- [ ] 10. Delete old JS files (probe.js, lib/)
-- [ ] 11. Build + verify: `tsc` compiles cleanly, `node dist/probe.js serve` works
+**Problem:** Sessions accumulate in activeSessions Map forever. No auto-cleanup. idle sessions never transition to done unless explicitly killed.
 
-### Key decisions
-- **Source dir**: `src/` — compiled output goes to `dist/`
-- **Module system**: CJS output (`"module": "commonjs"`) — same as current
-- **Target**: ES2022 (Node 18+)
-- **Strict mode**: enabled
-- **Types**: Add interfaces for Session, Event, etc. — real benefit of the migration
-- **Shebang**: tsc doesn't emit shebangs → add a thin `bin/probe` wrapper or use a plugin
-  - Simplest: `bin/probe.js` with `#!/usr/bin/env node\nrequire('../dist/probe.js')`
+**Changes in `server.ts`:**
+
+- [ ] Add `idleTimeoutMs` config (default 300s) — session auto-transitions idle→done after no new prompt
+- [ ] Add session GC: periodic sweep (every 60s) removes done/error sessions from activeSessions Map after `gcDelayMs` (default 60s)
+- [ ] On child process exit: if status is running/idle → set done (already done) + emit `session_complete`
+- [ ] On WS close: if status is not error → set done (already done)
+- [ ] Ensure terminal states (done/error) are truly terminal — no transitions back
+
+**Changes in `watchdog.ts`:**
+- [ ] Add `idleTimeout` timer alongside existing timers
+- [ ] `trackIdle(sessionId)` — called when session enters idle, starts idle timer
+- [ ] Fire `idle_timeout` reason when idle timer expires
+
+**Bug fix in `state.ts`:**
+- [ ] Fix `outputTokens` accumulation logic (line 63) — currently uses broken Math.max || addition
+
+### 1B. Operational controls
+
+**Changes — new `src/lib/limits.ts`:**
+- [ ] `SessionLimits` interface: `{ maxCostUsd, maxTurns, maxDurationMs, maxConcurrentSessions }`
+- [ ] `checkLimits(session, limits)` → returns `{ exceeded: boolean, reason: string }`
+- [ ] Checked on every `usage` event and `session_end` event
+
+**Changes in `server.ts`:**
+- [ ] Accept `limits` in `CreateSessionOpts` and `createServer()` opts (global defaults)
+- [ ] Per-session limits override global defaults
+- [ ] On limit exceeded: set status=error, errorCode='limit_exceeded', kill process
+- [ ] Max concurrent sessions check in `createSession()` — reject with 429 if at limit
+
+**Changes in `probe.ts` (CLI):**
+- [ ] `serve` accepts `--max-cost`, `--max-turns`, `--max-duration`, `--max-sessions`
+- [ ] `new` accepts `--max-cost`, `--max-turns` per-session
+
+**Changes — circuit breaker (lightweight):**
+- [ ] Track consecutive spawn failures in server state
+- [ ] After N consecutive failures (default 3), reject new sessions for cooldown period (30s)
+- [ ] Reset counter on successful session start (first event received)
+
+### API additions
+- `GET /api/sessions/:id/status` — add `limits` and `limitsExceeded` fields
+- `GET /api/diagnostics` — add `circuitBreaker` status, `globalLimits`
 
 ### Unresolved questions
-None — straightforward migration.
+- Should idle timeout be configurable per-session or only global? → **Global only for now, simpler**
+- Should cost limits include child session costs? → **No, not until PR 3 adds parent/child tracking**

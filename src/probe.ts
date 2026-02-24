@@ -149,8 +149,22 @@ async function cmdServe(): Promise<void> {
   const noBrowser = hasFlag('--no-browser');
   const publicDir = path.join(__dirname, '..', 'public');
   const claudePath = getFlag('--claude-path');
+  // Parse global limit flags
+  const limits: Record<string, number> = {};
+  const maxCost = getFlag('--max-cost');
+  if (maxCost) limits.maxCostUsd = parseFloat(maxCost);
+  const maxTurns = getFlag('--max-turns');
+  if (maxTurns) limits.maxTurns = parseInt(maxTurns, 10);
+  const maxDuration = getFlag('--max-duration');
+  if (maxDuration) limits.maxDurationMs = parseInt(maxDuration, 10) * 60_000; // minutes → ms
+  const maxSessions = getFlag('--max-sessions');
+  if (maxSessions) limits.maxConcurrentSessions = parseInt(maxSessions, 10);
+
   const store = new SessionStore(dataDir);
-  const server = createServer(port, publicDir, store, { claudePath: claudePath || undefined });
+  const server = createServer(port, publicDir, store, {
+    claudePath: claudePath || undefined,
+    limits: Object.keys(limits).length > 0 ? limits : undefined,
+  });
 
   await server.start();
   const url = `http://localhost:${port}`;
@@ -189,6 +203,13 @@ async function cmdNew(): Promise<void> {
   if (allowedTools) flags.push('--allowedTools', allowedTools);
   if (hasFlag('--dangerously-skip-permissions')) flags.push('--dangerously-skip-permissions');
   if (flags.length) body.flags = flags;
+  // Per-session limits
+  const sessionLimits: Record<string, number> = {};
+  const sCost = getFlag('--max-cost');
+  if (sCost) sessionLimits.maxCostUsd = parseFloat(sCost);
+  const sTurns = getFlag('--max-turns');
+  if (sTurns) sessionLimits.maxTurns = parseInt(sTurns, 10);
+  if (Object.keys(sessionLimits).length > 0) body.limits = sessionLimits;
 
   const res = await httpPost('/api/sessions', body);
   if (res.status !== 200) {
@@ -504,6 +525,14 @@ Options for 'new':
   --auto-approve                Auto-approve all tool use
   --cwd <dir>                   Working directory
   -r, --resume <session-id>     Resume a Claude session
+  --max-cost <usd>              Per-session cost cap (e.g. 0.50)
+  --max-turns <n>               Per-session turn limit
+
+Options for 'serve':
+  --max-cost <usd>              Global default cost cap per session
+  --max-turns <n>               Global default turn limit
+  --max-duration <minutes>      Global default duration limit
+  --max-sessions <n>            Max concurrent active sessions
 
 Global:
   --port <port>                 Server port (default: 3456)
