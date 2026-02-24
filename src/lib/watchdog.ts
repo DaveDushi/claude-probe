@@ -3,6 +3,7 @@ export interface WatchdogConfig {
   firstEventTimeoutMs: number;
   heartbeatTimeoutMs: number;
   approvalTimeoutMs: number;
+  idleTimeoutMs: number;
 }
 
 interface TimerEntry {
@@ -10,6 +11,7 @@ interface TimerEntry {
   firstEvent: ReturnType<typeof setTimeout> | null;
   heartbeat: ReturnType<typeof setTimeout> | null;
   approval: ReturnType<typeof setTimeout> | null;
+  idle: ReturnType<typeof setTimeout> | null;
 }
 
 export type TimeoutCallback = (sessionId: string, reason: string, message: string) => void;
@@ -19,12 +21,14 @@ const DEFAULTS: WatchdogConfig = {
   firstEventTimeoutMs: 60_000,
   heartbeatTimeoutMs: 120_000,
   approvalTimeoutMs: 0, // 0 = disabled
+  idleTimeoutMs: 300_000, // 5 minutes idle → done
 };
 
 export class SessionWatchdog {
   config: WatchdogConfig;
   timers: Map<string, TimerEntry> = new Map();
   onTimeout: TimeoutCallback | null = null;
+  onIdleExpired: ((sessionId: string) => void) | null = null;
 
   constructor(opts: Partial<WatchdogConfig> = {}) {
     this.config = { ...DEFAULTS, ...opts };
@@ -33,7 +37,7 @@ export class SessionWatchdog {
   /** Called when session created (status: starting). Starts startup timer. */
   trackStarting(sessionId: string): void {
     this._clear(sessionId);
-    const entry: TimerEntry = { startup: null, firstEvent: null, heartbeat: null, approval: null };
+    const entry: TimerEntry = { startup: null, firstEvent: null, heartbeat: null, approval: null, idle: null };
     if (this.config.startupTimeoutMs > 0) {
       entry.startup = setTimeout(() => {
         this._fire(sessionId, 'startup_timeout',
@@ -48,6 +52,7 @@ export class SessionWatchdog {
     const entry = this.timers.get(sessionId);
     if (!entry) return;
     if (entry.startup) { clearTimeout(entry.startup); entry.startup = null; }
+    if (entry.idle) { clearTimeout(entry.idle); entry.idle = null; }
     if (this.config.firstEventTimeoutMs > 0 && !entry.firstEvent) {
       entry.firstEvent = setTimeout(() => {
         this._fire(sessionId, 'first_event_timeout',
@@ -91,6 +96,22 @@ export class SessionWatchdog {
     this.trackActivity(sessionId);
   }
 
+  /** Called when session enters idle (turn complete, waiting for next prompt). Starts idle timer. */
+  trackIdle(sessionId: string): void {
+    const entry = this.timers.get(sessionId);
+    if (!entry) return;
+    // Clear running-phase timers
+    if (entry.heartbeat) { clearTimeout(entry.heartbeat); entry.heartbeat = null; }
+    if (entry.firstEvent) { clearTimeout(entry.firstEvent); entry.firstEvent = null; }
+    // Start idle timer
+    if (entry.idle) clearTimeout(entry.idle);
+    if (this.config.idleTimeoutMs > 0) {
+      entry.idle = setTimeout(() => {
+        if (this.onIdleExpired) this.onIdleExpired(sessionId);
+      }, this.config.idleTimeoutMs);
+    }
+  }
+
   /** Called when session ends (done/error). Clears all timers. */
   untrack(sessionId: string): void {
     this._clear(sessionId);
@@ -113,6 +134,7 @@ export class SessionWatchdog {
     if (entry.firstEvent) clearTimeout(entry.firstEvent);
     if (entry.heartbeat) clearTimeout(entry.heartbeat);
     if (entry.approval) clearTimeout(entry.approval);
+    if (entry.idle) clearTimeout(entry.idle);
     this.timers.delete(sessionId);
   }
 }

@@ -42,6 +42,7 @@ export class SessionState {
   model: string | null = null;
   sessionId: string | null = null;
   startTime: number = Date.now();
+  turns: number = 0;
   activeBlocks: Record<number, ActiveBlock> = {};
   toolResults: Record<string, { content: string; isError: boolean }> = {};
 
@@ -60,13 +61,24 @@ export class SessionState {
 
       case 'usage':
         if (event.inputTokens) this.usage.inputTokens += event.inputTokens as number;
-        if (event.outputTokens) this.usage.outputTokens = Math.max(this.usage.outputTokens, event.outputTokens as number) || this.usage.outputTokens + (event.outputTokens as number);
+        // Streaming: output_tokens is cumulative per message (use max).
+        // Complete mode: each message has independent usage (additive).
+        // Heuristic: if new value > current, it's cumulative (take max); otherwise additive.
+        if (event.outputTokens) {
+          const incoming = event.outputTokens as number;
+          if (incoming > this.usage.outputTokens) {
+            this.usage.outputTokens = incoming; // cumulative (streaming)
+          } else {
+            this.usage.outputTokens += incoming; // new turn (complete mode)
+          }
+        }
         if (event.cacheCreation) this.usage.cacheCreation += event.cacheCreation as number;
         if (event.cacheRead) this.usage.cacheRead += event.cacheRead as number;
         break;
 
       case 'session_end':
         if (event.costUsd) this.usage.costUsd = event.costUsd as number;
+        if (event.numTurns) this.turns = event.numTurns as number;
         break;
 
       case 'block_start':
