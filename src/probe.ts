@@ -203,6 +203,11 @@ async function cmdNew(): Promise<void> {
   if (allowedTools) flags.push('--allowedTools', allowedTools);
   if (hasFlag('--dangerously-skip-permissions')) flags.push('--dangerously-skip-permissions');
   if (flags.length) body.flags = flags;
+  // Parent/child linkage
+  const parent = getFlag('--parent');
+  if (parent) body.parentSessionId = parent;
+  const reason = getFlag('--reason');
+  if (reason) body.spawnReason = reason;
   // Per-session limits
   const sessionLimits: Record<string, number> = {};
   const sCost = getFlag('--max-cost');
@@ -237,6 +242,13 @@ async function cmdStatus(): Promise<void> {
   if (s.costUsd) line += ` | cost: ${formatCost(s.costUsd as number)}`;
   if (s.eventCount) line += ` | events: ${s.eventCount}`;
   process.stdout.write(line + '\n');
+
+  if (s.parentSessionId) process.stdout.write(`parent: ${s.parentSessionId}\n`);
+  if (s.childSessionIds && (s.childSessionIds as string[]).length > 0) {
+    process.stdout.write(`children: ${(s.childSessionIds as string[]).join(', ')}\n`);
+  }
+  if (s.spawnReason) process.stdout.write(`reason: ${s.spawnReason}\n`);
+  if (s.artifactCount) process.stdout.write(`artifacts: ${s.artifactCount} files\n`);
 
   if (s.stuckForMs && (s.stuckForMs as number) > 30000) {
     process.stdout.write(`warning: no activity for ${formatDuration(s.stuckForMs as number)}\n`);
@@ -375,12 +387,14 @@ async function cmdClose(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe close: session ID required\n'); process.exit(1); }
 
-  const res = await httpPost(`/api/sessions/${id}/close`, {});
+  const tree = hasFlag('--tree');
+  const res = await httpPost(`/api/sessions/${id}/close`, { tree });
   if (res.status !== 200) {
     process.stderr.write(`probe close: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
-  process.stdout.write(`closed${asRecord(res.data).wasActive ? '' : ' (was already done)'}\n`);
+  const suffix = tree ? ' (tree)' : '';
+  process.stdout.write(`closed${asRecord(res.data).wasActive ? '' : ' (was already done)'}${suffix}\n`);
 }
 
 async function cmdShutdown(): Promise<void> {
@@ -412,6 +426,39 @@ async function cmdResult(): Promise<void> {
   }
 }
 
+async function cmdArtifacts(): Promise<void> {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe artifacts: session ID required\n'); process.exit(1); }
+
+  const res = await httpGet(`/api/sessions/${id}/artifacts`);
+  if (res.status !== 200) {
+    process.stderr.write(`probe artifacts: ${asRecord(res.data).error || 'not found'}\n`);
+    process.exit(1);
+  }
+
+  const artifacts = (asRecord(res.data).artifacts || []) as Record<string, unknown>[];
+  if (artifacts.length === 0) {
+    process.stdout.write('no artifacts\n');
+    return;
+  }
+
+  // Deduplicate by path, keeping latest operation
+  const byPath = new Map<string, Record<string, unknown>>();
+  for (const a of artifacts) {
+    const existing = byPath.get(a.filePath as string);
+    if (!existing || (a.ts as number) > (existing.ts as number)) {
+      byPath.set(a.filePath as string, a);
+    }
+  }
+
+  for (const [filePath, a] of byPath) {
+    const op = a.operation as string;
+    const icon = op === 'created' ? '+' : op === 'modified' ? '~' : '.';
+    process.stdout.write(`${icon} ${op.padEnd(8)} ${filePath}\n`);
+  }
+  process.stdout.write(`\n${byPath.size} files (${artifacts.length} operations)\n`);
+}
+
 async function cmdSessions(): Promise<void> {
   const res = await httpGet('/api/sessions');
   if (res.status !== 200) {
@@ -425,6 +472,11 @@ async function cmdSessions(): Promise<void> {
     return;
   }
 
+  if (hasFlag('--tree')) {
+    renderSessionTree(sessions);
+    return;
+  }
+
   for (const s of sessions) {
     let line = `${s.id}`;
     if (s.status) line += ` [${s.status}]`;
@@ -432,8 +484,58 @@ async function cmdSessions(): Promise<void> {
     if (s.model) line += ` ${s.model}`;
     if (s.costUsd) line += ` ${formatCost(s.costUsd as number)}`;
     if (s.toolCalls) line += ` ${s.toolCalls}tools`;
+    if (s.artifactCount) line += ` ${s.artifactCount}files`;
     if (s.preview) line += ` "${truncate(s.preview as string, 60)}"`;
     process.stdout.write(line + '\n');
+  }
+}
+
+function renderSessionTree(sessions: Record<string, unknown>[]): void {
+  const childMap = new Map<string, Record<string, unknown>[]>();
+  const roots: Record<string, unknown>[] = [];
+
+  for (const s of sessions) {
+    if (s.parentSessionId) {
+      const siblings = childMap.get(s.parentSessionId as string) || [];
+      siblings.push(s);
+      childMap.set(s.parentSessionId as string, siblings);
+    } else {
+      roots.push(s);
+    }
+  }
+
+  function formatSession(s: Record<string, unknown>): string {
+    let line = `${s.id}`;
+    if (s.status) line += ` [${s.status}]`;
+    else if (s.ended) line += ' [done]';
+    if (s.model) line += ` ${s.model}`;
+    if (s.costUsd) line += ` ${formatCost(s.costUsd as number)}`;
+    if (s.toolCalls) line += ` ${s.toolCalls}tools`;
+    if (s.artifactCount) line += ` ${s.artifactCount}files`;
+    return line;
+  }
+
+  function printNode(s: Record<string, unknown>, prefix: string, isLast: boolean): void {
+    const connector = isLast ? '\\-- ' : '|-- ';
+    process.stdout.write(prefix + connector + formatSession(s) + '\n');
+    const children = childMap.get(s.id as string) || [];
+    const childPrefix = prefix + (isLast ? '    ' : '|   ');
+    for (let i = 0; i < children.length; i++) {
+      printNode(children[i], childPrefix, i === children.length - 1);
+    }
+  }
+
+  for (let i = 0; i < roots.length; i++) {
+    if (i === 0) {
+      // Root sessions printed without prefix
+      process.stdout.write(formatSession(roots[i]) + '\n');
+    } else {
+      process.stdout.write(formatSession(roots[i]) + '\n');
+    }
+    const children = childMap.get(roots[i].id as string) || [];
+    for (let j = 0; j < children.length; j++) {
+      printNode(children[j], '', j === children.length - 1);
+    }
   }
 }
 
@@ -594,6 +696,7 @@ Commands:
   deny <id> [-m "reason"]       Deny pending tool use
   result <id>                   Get final result text
   sessions                      List all sessions
+  artifacts <id>                List files created/modified/read
   doctor                        Server/session health diagnostics
   policy add --tool <pattern>   Add approval policy (e.g. "Write", "*")
   policy list                   List active policies
@@ -604,8 +707,16 @@ Options for 'new':
   --auto-approve                Auto-approve all tool use
   --cwd <dir>                   Working directory
   -r, --resume <session-id>     Resume a Claude session
+  --parent <id>                 Parent session (creates child link)
+  --reason <text>               Spawn reason for child session
   --max-cost <usd>              Per-session cost cap (e.g. 0.50)
   --max-turns <n>               Per-session turn limit
+
+Options for 'close':
+  --tree                        Also close all child sessions
+
+Options for 'sessions':
+  --tree                        Show parent/child tree view
 
 Options for 'serve':
   --max-cost <usd>              Global default cost cap per session
@@ -665,6 +776,10 @@ switch (command) {
     break;
   case 'result':
     cmdResult();
+    break;
+  case 'artifacts':
+  case 'files':
+    cmdArtifacts();
     break;
   case 'sessions':
   case 'list':

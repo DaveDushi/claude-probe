@@ -173,6 +173,7 @@
             </span>
             <span class="session-stat" title="Turns">${s.numTurns || '--'} turns</span>
             <span class="session-stat" title="Tool calls">${s.toolCalls || '--'} tools</span>
+            <span class="session-stat" title="Artifacts">${s.artifactCount || '--'} files</span>
             <span class="session-stat" title="Events">${s.eventCount || '--'} events</span>
             <span class="session-stat dim" title="File size">${formatSize(s.fileSize)}</span>
           </div>
