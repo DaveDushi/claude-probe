@@ -2,13 +2,15 @@
   "name": "claude-probe",
   "version": "2.1.0",
   "description": "CLI + dashboard for controlling and monitoring Claude Code sessions",
-  "main": "probe.js",
+  "main": "dist/probe.js",
   "bin": {
-    "claude-probe": "./probe.js",
-    "probe": "./probe.js"
+    "claude-probe": "./bin/probe.js",
+    "probe": "./bin/probe.js"
   },
   "scripts": {
-    "start": "node probe.js serve"
+    "build": "tsc",
+    "start": "node dist/probe.js serve",
+    "dev": "tsc --watch"
   },
   "dependencies": {
     "ws": "^8.18.0"
@@ -35,5 +37,10 @@
   "author": "DaveDushi",
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
   }
 }
