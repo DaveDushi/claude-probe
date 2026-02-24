@@ -1,83 +1,39 @@
-# Claude Probe: OpenClaw Integration
+# JS → TS Migration (Backend Only)
 
-## Status: Phases 1-4 Complete, Phase 5 (Dashboard) Pending
+## Plan
 
-## What's Done
+Convert 6 backend JS files to TypeScript. Frontend (public/) stays vanilla JS.
 
-### Phase 1: --sdk-url protocol + server-side spawning ✅
-- Server sends `user` message first (fixed protocol)
-- Server spawns Claude CLI with `--sdk-url` pointing back to itself
-- Auto-detects claude binary (checks common install paths)
-- Cleans env vars to avoid nesting guard (CLAUDECODE, etc.)
+### Files to convert
+- `probe.js` → `src/probe.ts` (571 lines, CLI entry point)
+- `lib/parser.js` → `src/lib/parser.ts` (232 lines)
+- `lib/server.js` → `src/lib/server.ts` (1006 lines)
+- `lib/state.js` → `src/lib/state.ts` (112 lines)
+- `lib/store.js` → `src/lib/store.ts` (176 lines)
+- `lib/watchdog.js` → `src/lib/watchdog.ts` (112 lines)
 
-### Phase 2: Permission control API ✅
-- `POST /api/sessions/:id/approve` — approve pending tool use
-- `POST /api/sessions/:id/deny` — deny with reason
-- `--auto-approve` flag for fire-and-forget mode
-- Without auto-approve, control_requests are queued for external approval
-- `approval_request` events broadcast to dashboard
+### Steps
 
-### Phase 3: Multi-turn + session control ✅
-- `POST /api/sessions/:id/message` — send follow-up prompt
-- `GET /api/sessions/:id/events?last=N` — event log
-- `GET /api/sessions/:id/result` — final text
-- `DELETE /api/sessions/:id` — kill session
-- State machine: starting → running → idle → running → ... → done
-- Prompt queue for messages sent while CLI is busy
+- [ ] 1. Setup: tsconfig.json, add `typescript` + `@types/ws` + `@types/node` devDeps
+- [ ] 2. Create `src/` dir, convert `lib/state.js` → `src/lib/state.ts` (simplest, no deps)
+- [ ] 3. Convert `lib/watchdog.js` → `src/lib/watchdog.ts` (simple, no deps)
+- [ ] 4. Convert `lib/parser.js` → `src/lib/parser.ts` (standalone)
+- [ ] 5. Convert `lib/store.js` → `src/lib/store.ts` (fs only)
+- [ ] 6. Convert `lib/server.js` → `src/lib/server.ts` (biggest, depends on all above + ws)
+- [ ] 7. Convert `probe.js` → `src/probe.ts` (CLI entry, depends on server + store)
+- [ ] 8. Update package.json: bin→dist/, scripts (build, start, dev), engine
+- [ ] 9. Update .gitignore: add `dist/`
+- [ ] 10. Delete old JS files (probe.js, lib/)
+- [ ] 11. Build + verify: `tsc` compiles cleanly, `node dist/probe.js serve` works
 
-### Phase 4: CLI tool ✅
-- Commands: serve, new, status, events, send, approve, deny, result, sessions
-- Plain text output, token-efficient for AI agents
-- `bin` in package.json: `probe` and `claude-probe` (global install)
-- `--port`, `--model`, `--auto-approve`, `--cwd`, `--permission-mode`, `--allowedTools`
+### Key decisions
+- **Source dir**: `src/` — compiled output goes to `dist/`
+- **Module system**: CJS output (`"module": "commonjs"`) — same as current
+- **Target**: ES2022 (Node 18+)
+- **Strict mode**: enabled
+- **Types**: Add interfaces for Session, Event, etc. — real benefit of the migration
+- **Shebang**: tsc doesn't emit shebangs → add a thin `bin/probe` wrapper or use a plugin
+  - Simplest: `bin/probe.js` with `#!/usr/bin/env node\nrequire('../dist/probe.js')`
 
-### Phase 5: Dashboard updates (TODO)
-- [ ] Show pending approval state on timeline (highlighted card)
-- [ ] Show multi-session support (session picker or tabs)
-- [ ] Show which external client sent each prompt
-
-## Test Results
-- ✅ Session creation (returns immediately with ID)
-- ✅ Auto-approve mode (Claude runs to completion)
-- ✅ Multi-turn conversation (send follow-up, get new result)
-- ✅ Status, events, result commands
-- ✅ Sessions list (merges active + stored)
-- ✅ Session cost tracking ($0.0777 over 2 turns)
-- ⚠️ Permission queuing (code ready, needs restrictive --permission-mode to trigger)
-
-## How to Test
-
-```bash
-# Terminal 1: Start server
-node probe.js serve --port 3456
-
-# Terminal 2: Create session
-SESSION=$(node probe.js new -p "Say hello" --auto-approve)
-echo $SESSION
-
-# Check status
-node probe.js status $SESSION
-
-# Get events
-node probe.js events $SESSION
-
-# Get result
-node probe.js result $SESSION
-
-# Send follow-up
-node probe.js send $SESSION -p "Now say goodbye"
-sleep 5
-node probe.js result $SESSION
-
-# List all sessions
-node probe.js sessions
-
-# Test permission mode (will queue tool approvals)
-SESSION2=$(node probe.js new -p "Create a file called test.txt")
-sleep 5
-node probe.js status $SESSION2
-# If waiting_approval:
-node probe.js approve $SESSION2
-# or:
-node probe.js deny $SESSION2 -m "don't create files"
-```
+### Unresolved questions
+None — straightforward migration.

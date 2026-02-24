@@ -1,8 +1,6 @@
-#!/usr/bin/env node
-
-const path = require('node:path');
-const http = require('node:http');
-const { exec } = require('node:child_process');
+import path from 'node:path';
+import http from 'node:http';
+import { exec } from 'node:child_process';
 
 const args = process.argv.slice(2);
 
@@ -21,17 +19,22 @@ const BASE = `http://localhost:${port}`;
 // HTTP helpers
 // ================================================================
 
-function httpGet(urlPath) {
+interface HttpResponse {
+  status: number;
+  data: Record<string, unknown> | string;
+}
+
+function httpGet(urlPath: string): Promise<HttpResponse> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlPath, BASE);
     http.get({ hostname: url.hostname, port: url.port, path: url.pathname + url.search }, (res) => {
       let data = '';
-      res.on('data', c => data += c);
+      res.on('data', (c: Buffer | string) => data += c);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch { resolve({ status: res.statusCode, data }); }
+        try { resolve({ status: res.statusCode!, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode!, data }); }
       });
-    }).on('error', (err) => {
+    }).on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'ECONNREFUSED') {
         process.stderr.write(`probe: Server not running on port ${port}. Start with: probe serve\n`);
         process.exit(1);
@@ -41,7 +44,7 @@ function httpGet(urlPath) {
   });
 }
 
-function httpPost(urlPath, body) {
+function httpPost(urlPath: string, body: unknown): Promise<HttpResponse> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlPath, BASE);
     const payload = typeof body === 'string' ? body : JSON.stringify(body);
@@ -53,13 +56,13 @@ function httpPost(urlPath, body) {
       headers: { 'Content-Type': 'application/json' },
     }, (res) => {
       let data = '';
-      res.on('data', c => data += c);
+      res.on('data', (c: Buffer | string) => data += c);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch { resolve({ status: res.statusCode, data }); }
+        try { resolve({ status: res.statusCode!, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode!, data }); }
       });
     });
-    req.on('error', (err) => {
+    req.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'ECONNREFUSED') {
         process.stderr.write(`probe: Server not running on port ${port}. Start with: probe serve\n`);
         process.exit(1);
@@ -71,7 +74,7 @@ function httpPost(urlPath, body) {
   });
 }
 
-function httpDelete(urlPath) {
+function httpDelete(urlPath: string): Promise<HttpResponse> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlPath, BASE);
     const req = http.request({
@@ -81,10 +84,10 @@ function httpDelete(urlPath) {
       method: 'DELETE',
     }, (res) => {
       let data = '';
-      res.on('data', c => data += c);
+      res.on('data', (c: Buffer | string) => data += c);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch { resolve({ status: res.statusCode, data }); }
+        try { resolve({ status: res.statusCode!, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode!, data }); }
       });
     });
     req.on('error', reject);
@@ -96,18 +99,18 @@ function httpDelete(urlPath) {
 // CLI helpers
 // ================================================================
 
-function getFlag(flag, argList) {
-  argList = argList || args;
-  const idx = argList.indexOf(flag);
-  if (idx !== -1 && argList[idx + 1]) return argList[idx + 1];
+function getFlag(flag: string, argList?: string[]): string | null {
+  const list = argList || args;
+  const idx = list.indexOf(flag);
+  if (idx !== -1 && list[idx + 1]) return list[idx + 1];
   return null;
 }
 
-function hasFlag(flag, argList) {
+function hasFlag(flag: string, argList?: string[]): boolean {
   return (argList || args).includes(flag);
 }
 
-function formatDuration(ms) {
+function formatDuration(ms: number): string {
   if (!ms) return '-';
   if (ms < 1000) return `${ms}ms`;
   const s = Math.round(ms / 1000);
@@ -115,34 +118,39 @@ function formatDuration(ms) {
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-function formatCost(usd) {
+function formatCost(usd: number): string {
   if (!usd) return '-';
   return `$${usd.toFixed(4)}`;
 }
 
-function truncate(str, len) {
+function truncate(str: string, len: number): string {
   if (!str) return '';
   str = str.replace(/\n/g, ' ').trim();
   return str.length > len ? str.slice(0, len) + '...' : str;
+}
+
+// Helper to safely get data as record
+function asRecord(data: unknown): Record<string, unknown> {
+  return data as Record<string, unknown>;
 }
 
 // ================================================================
 // Commands
 // ================================================================
 
-async function cmdServe() {
-  const { SessionStore } = require('./lib/store');
-  const { createServer } = require('./lib/server');
+async function cmdServe(): Promise<void> {
+  const { SessionStore } = await import('./lib/store');
+  const { createServer } = await import('./lib/server');
 
-  let dataDir = path.join(__dirname, 'sessions');
+  let dataDir = path.join(__dirname, '..', 'sessions');
   const dataDirFlag = getFlag('--data-dir');
   if (dataDirFlag) dataDir = path.resolve(dataDirFlag);
 
   const noBrowser = hasFlag('--no-browser');
-  const publicDir = path.join(__dirname, 'public');
+  const publicDir = path.join(__dirname, '..', 'public');
   const claudePath = getFlag('--claude-path');
   const store = new SessionStore(dataDir);
-  const server = createServer(port, publicDir, store, { claudePath });
+  const server = createServer(port, publicDir, store, { claudePath: claudePath || undefined });
 
   await server.start();
   const url = `http://localhost:${port}`;
@@ -159,14 +167,14 @@ async function cmdServe() {
   }
 }
 
-async function cmdNew() {
+async function cmdNew(): Promise<void> {
   const prompt = getFlag('-p') || getFlag('--prompt');
   if (!prompt) {
     process.stderr.write('probe new: -p "prompt" required\n');
     process.exit(1);
   }
 
-  const body = { prompt };
+  const body: Record<string, unknown> = { prompt };
   const model = getFlag('--model');
   if (model) body.model = model;
   if (hasFlag('--auto-approve')) body.autoApprove = true;
@@ -174,8 +182,7 @@ async function cmdNew() {
   if (cwd) body.cwd = path.resolve(cwd);
   const resume = getFlag('-r') || getFlag('--resume');
   if (resume) body.resumeSessionId = resume;
-  // Collect passthrough flags for Claude CLI
-  const flags = [];
+  const flags: string[] = [];
   const permMode = getFlag('--permission-mode');
   if (permMode) flags.push('--permission-mode', permMode);
   const allowedTools = getFlag('--allowedTools') || getFlag('--allowed-tools');
@@ -185,40 +192,40 @@ async function cmdNew() {
 
   const res = await httpPost('/api/sessions', body);
   if (res.status !== 200) {
-    process.stderr.write(`probe new: ${res.data.error || 'failed'}\n`);
+    process.stderr.write(`probe new: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
-  process.stdout.write(`${res.data.sessionId}\n`);
+  process.stdout.write(`${asRecord(res.data).sessionId}\n`);
 }
 
-async function cmdStatus() {
+async function cmdStatus(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe status: session ID required\n'); process.exit(1); }
 
   const res = await httpGet(`/api/sessions/${id}/status`);
   if (res.status !== 200) {
-    process.stderr.write(`probe status: ${res.data.error || 'not found'}\n`);
+    process.stderr.write(`probe status: ${asRecord(res.data).error || 'not found'}\n`);
     process.exit(1);
   }
 
-  const s = res.data;
+  const s = asRecord(res.data);
   let line = `status: ${s.status}`;
   if (s.phase && s.phase !== s.status) line += ` (${s.phase})`;
   if (s.model) line += ` | model: ${s.model}`;
   if (s.toolCalls) line += ` | tools: ${s.toolCalls}`;
-  if (s.costUsd) line += ` | cost: ${formatCost(s.costUsd)}`;
+  if (s.costUsd) line += ` | cost: ${formatCost(s.costUsd as number)}`;
   if (s.eventCount) line += ` | events: ${s.eventCount}`;
   process.stdout.write(line + '\n');
 
-  if (s.stuckForMs && s.stuckForMs > 30000) {
-    process.stdout.write(`warning: no activity for ${formatDuration(s.stuckForMs)}\n`);
+  if (s.stuckForMs && (s.stuckForMs as number) > 30000) {
+    process.stdout.write(`warning: no activity for ${formatDuration(s.stuckForMs as number)}\n`);
   }
 
   if (s.pendingApproval) {
-    const a = s.pendingApproval;
+    const a = s.pendingApproval as Record<string, unknown>;
     let detail = `awaiting: ${a.toolName}`;
     if (a.requestedAt) {
-      detail += ` (waiting ${formatDuration(Date.now() - a.requestedAt)})`;
+      detail += ` (waiting ${formatDuration(Date.now() - (a.requestedAt as number))})`;
     }
     if (a.input) {
       const inputStr = typeof a.input === 'string' ? a.input : JSON.stringify(a.input);
@@ -233,20 +240,20 @@ async function cmdStatus() {
   }
 }
 
-async function cmdEvents() {
+async function cmdEvents(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe events: session ID required\n'); process.exit(1); }
 
   const last = getFlag('--last') || '20';
   const res = await httpGet(`/api/sessions/${id}/events?last=${last}`);
   if (res.status !== 200) {
-    process.stderr.write(`probe events: ${res.data.error || 'not found'}\n`);
+    process.stderr.write(`probe events: ${asRecord(res.data).error || 'not found'}\n`);
     process.exit(1);
   }
 
-  const events = res.data.events || [];
+  const events = (asRecord(res.data).events || []) as Record<string, unknown>[];
   for (const e of events) {
-    const time = new Date(e.ts).toLocaleTimeString('en-US', { hour12: false });
+    const time = new Date(e.ts as number).toLocaleTimeString('en-US', { hour12: false });
     let line = `[${time}] `;
 
     switch (e.kind) {
@@ -254,18 +261,18 @@ async function cmdEvents() {
         line += `init model=${e.model}`;
         break;
       case 'text':
-        line += `text: ${truncate(e.text, 120)}`;
+        line += `text: ${truncate(e.text as string, 120)}`;
         break;
       case 'text_delta':
-        continue; // skip deltas in summary view
+        continue;
       case 'tool_call':
         line += `tool: ${e.toolName} ${truncate(typeof e.input === 'string' ? e.input : JSON.stringify(e.input), 100)}`;
         break;
       case 'tool_result':
-        line += `result: ${truncate(e.content, 100)}${e.isError ? ' [ERROR]' : ''}`;
+        line += `result: ${truncate(e.content as string, 100)}${e.isError ? ' [ERROR]' : ''}`;
         break;
       case 'thinking':
-        line += `thinking: ${truncate(e.text, 80)}`;
+        line += `thinking: ${truncate(e.text as string, 80)}`;
         break;
       case 'approval_request':
         line += `APPROVAL NEEDED: ${e.toolName} ${truncate(typeof e.input === 'string' ? e.input : JSON.stringify(e.input), 100)}`;
@@ -280,10 +287,10 @@ async function cmdEvents() {
         line += `TIMEOUT: ${e.reason} — ${e.message}`;
         break;
       case 'session_end':
-        line += `end: ${e.isError ? 'ERROR' : 'ok'} cost=${formatCost(e.costUsd)} turns=${e.numTurns}`;
+        line += `end: ${e.isError ? 'ERROR' : 'ok'} cost=${formatCost(e.costUsd as number)} turns=${e.numTurns}`;
         break;
       case 'session_complete':
-        line += `complete (${formatDuration(e.durationMs)})`;
+        line += `complete (${formatDuration(e.durationMs as number)})`;
         break;
       case 'session_resumed':
         line += `resumed`;
@@ -292,18 +299,18 @@ async function cmdEvents() {
         if (e.blockType === 'tool_use') {
           line += `tool_start: ${e.toolName}`;
         } else {
-          continue; // skip text/thinking block_start
+          continue;
         }
         break;
       default:
-        continue; // skip noisy events
+        continue;
     }
 
     process.stdout.write(line + '\n');
   }
 }
 
-async function cmdSend() {
+async function cmdSend(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe send: session ID required\n'); process.exit(1); }
 
@@ -312,85 +319,86 @@ async function cmdSend() {
 
   const res = await httpPost(`/api/sessions/${id}/message`, { prompt });
   if (res.status !== 200) {
-    process.stderr.write(`probe send: ${res.data.error || 'failed'}\n`);
+    process.stderr.write(`probe send: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
-  process.stdout.write(`sent (${res.data.status})\n`);
+  process.stdout.write(`sent (${asRecord(res.data).status})\n`);
 }
 
-async function cmdApprove() {
+async function cmdApprove(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe approve: session ID required\n'); process.exit(1); }
 
   const res = await httpPost(`/api/sessions/${id}/approve`, {});
   if (res.status !== 200) {
-    process.stderr.write(`probe approve: ${res.data.error || 'failed'}\n`);
+    process.stderr.write(`probe approve: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
   process.stdout.write('approved\n');
 }
 
-async function cmdDeny() {
+async function cmdDeny(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe deny: session ID required\n'); process.exit(1); }
 
   const message = getFlag('-m') || getFlag('--message') || '';
   const res = await httpPost(`/api/sessions/${id}/deny`, { message });
   if (res.status !== 200) {
-    process.stderr.write(`probe deny: ${res.data.error || 'failed'}\n`);
+    process.stderr.write(`probe deny: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
   process.stdout.write('denied\n');
 }
 
-async function cmdClose() {
+async function cmdClose(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe close: session ID required\n'); process.exit(1); }
 
   const res = await httpPost(`/api/sessions/${id}/close`, {});
   if (res.status !== 200) {
-    process.stderr.write(`probe close: ${res.data.error || 'failed'}\n`);
+    process.stderr.write(`probe close: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
-  process.stdout.write(`closed${res.data.wasActive ? '' : ' (was already done)'}\n`);
+  process.stdout.write(`closed${asRecord(res.data).wasActive ? '' : ' (was already done)'}\n`);
 }
 
-async function cmdShutdown() {
+async function cmdShutdown(): Promise<void> {
   const res = await httpPost('/api/shutdown', {});
   if (res.status !== 200) {
-    process.stderr.write(`probe shutdown: ${res.data.error || 'failed'}\n`);
+    process.stderr.write(`probe shutdown: ${asRecord(res.data).error || 'failed'}\n`);
     process.exit(1);
   }
   process.stdout.write('server stopped\n');
 }
 
-async function cmdResult() {
+async function cmdResult(): Promise<void> {
   const id = args[1];
   if (!id) { process.stderr.write('probe result: session ID required\n'); process.exit(1); }
 
   const res = await httpGet(`/api/sessions/${id}/result`);
   if (res.status !== 200) {
-    process.stderr.write(`probe result: ${res.data.error || 'not found'}\n`);
+    process.stderr.write(`probe result: ${asRecord(res.data).error || 'not found'}\n`);
     process.exit(1);
   }
 
-  if (res.data.result) {
-    process.stdout.write(res.data.result + '\n');
-  } else if (res.data.status && res.data.status !== 'done') {
-    process.stdout.write(`(session still ${res.data.status})\n`);
+  const d = asRecord(res.data);
+  if (d.result) {
+    process.stdout.write(d.result + '\n');
+  } else if (d.status && d.status !== 'done') {
+    process.stdout.write(`(session still ${d.status})\n`);
   } else {
     process.stdout.write('(no result)\n');
   }
 }
 
-async function cmdSessions() {
+async function cmdSessions(): Promise<void> {
   const res = await httpGet('/api/sessions');
   if (res.status !== 200) {
     process.stderr.write('probe sessions: failed to list\n');
     process.exit(1);
   }
 
-  const sessions = res.data || [];
+  const sessions = (res.data || []) as Record<string, unknown>[];
   if (sessions.length === 0) {
     process.stdout.write('no sessions\n');
     return;
@@ -401,45 +409,44 @@ async function cmdSessions() {
     if (s.status) line += ` [${s.status}]`;
     else if (s.ended) line += ' [done]';
     if (s.model) line += ` ${s.model}`;
-    if (s.costUsd) line += ` ${formatCost(s.costUsd)}`;
+    if (s.costUsd) line += ` ${formatCost(s.costUsd as number)}`;
     if (s.toolCalls) line += ` ${s.toolCalls}tools`;
-    if (s.preview) line += ` "${truncate(s.preview, 60)}"`;
+    if (s.preview) line += ` "${truncate(s.preview as string, 60)}"`;
     process.stdout.write(line + '\n');
   }
 }
 
-async function cmdDoctor() {
-  // Step 1: Check server reachability
+async function cmdDoctor(): Promise<void> {
   let healthOk = false;
   try {
     const health = await httpGet('/api/health');
-    healthOk = health.status === 200 && health.data.ok;
+    const d = asRecord(health.data);
+    healthOk = health.status === 200 && d.ok === true;
     process.stdout.write(`server: ${healthOk ? 'OK' : 'UNHEALTHY'} (port ${port})\n`);
-    process.stdout.write(`  active sessions: ${health.data.activeSessions}\n`);
-  } catch (err) {
+    process.stdout.write(`  active sessions: ${d.activeSessions}\n`);
+  } catch (err: unknown) {
     process.stdout.write(`server: UNREACHABLE (port ${port})\n`);
-    process.stdout.write(`  ${err.message}\n`);
+    process.stdout.write(`  ${(err as Error).message}\n`);
     process.exit(1);
   }
 
-  // Step 2: Detailed diagnostics
   try {
     const diag = await httpGet('/api/diagnostics');
     if (diag.status === 200) {
-      const d = diag.data;
-      process.stdout.write(`  uptime: ${formatDuration(d.serverUptime * 1000)}\n`);
+      const d = asRecord(diag.data);
+      process.stdout.write(`  uptime: ${formatDuration((d.serverUptime as number) * 1000)}\n`);
       process.stdout.write(`  dashboard clients: ${d.dashboardClients}\n`);
       process.stdout.write(`  watchdog tracking: ${d.watchdogTracking}\n`);
 
-      if (d.sessions && d.sessions.length > 0) {
+      if (d.sessions && (d.sessions as unknown[]).length > 0) {
         process.stdout.write(`\nsessions:\n`);
-        for (const s of d.sessions) {
+        for (const s of d.sessions as Record<string, unknown>[]) {
           let line = `  ${s.sessionId} [${s.status}]`;
           line += ` proc=${s.processAlive ? 'alive' : 'dead'}`;
           line += ` ws=${s.wsConnected ? 'connected' : 'disconnected'}`;
           line += ` events=${s.eventCount}`;
-          if (s.stuckForMs && s.stuckForMs > 10000) {
-            line += ` stuck=${formatDuration(s.stuckForMs)}`;
+          if (s.stuckForMs && (s.stuckForMs as number) > 10000) {
+            line += ` stuck=${formatDuration(s.stuckForMs as number)}`;
           }
           if (s.error) line += ` error="${s.error}"`;
           process.stdout.write(line + '\n');
@@ -450,10 +457,9 @@ async function cmdDoctor() {
     process.stdout.write('  (diagnostics endpoint not available)\n');
   }
 
-  // Step 3: Quick WebSocket test
   try {
-    const WebSocket = require('ws');
-    await new Promise((resolve, reject) => {
+    const { default: WebSocket } = await import('ws');
+    await new Promise<void>((resolve, reject) => {
       const testWs = new WebSocket(`ws://localhost:${port}`);
       const timer = setTimeout(() => {
         testWs.close();
@@ -464,18 +470,18 @@ async function cmdDoctor() {
         testWs.close();
         resolve();
       });
-      testWs.on('error', (err) => {
+      testWs.on('error', (err: Error) => {
         clearTimeout(timer);
         reject(err);
       });
     });
     process.stdout.write(`websocket: OK\n`);
-  } catch (err) {
-    process.stdout.write(`websocket: FAILED (${err.message})\n`);
+  } catch (err: unknown) {
+    process.stdout.write(`websocket: FAILED (${(err as Error).message})\n`);
   }
 }
 
-function printUsage() {
+function printUsage(): void {
   process.stderr.write(`
 claude-probe - control Claude Code sessions
 
@@ -504,6 +510,9 @@ Global:
 
 `);
 }
+
+// Suppress unused warnings for functions that are part of the public API
+void httpDelete;
 
 // ================================================================
 // Dispatch
@@ -560,7 +569,6 @@ switch (command) {
     printUsage();
     break;
   default:
-    // No args → serve
     if (!command || command.startsWith('-')) {
       cmdServe();
     } else {

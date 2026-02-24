@@ -1,10 +1,12 @@
+import { ProbeEvent } from './state';
+
 let eventCounter = 0;
 
-function makeId() {
+function makeId(): string {
   return `evt_${Date.now()}_${++eventCounter}`;
 }
 
-function makeEvent(kind, payload) {
+function makeEvent(kind: string, payload: Record<string, unknown>): ProbeEvent {
   return { id: makeId(), ts: Date.now(), kind, ...payload };
 }
 
@@ -12,18 +14,18 @@ function makeEvent(kind, payload) {
  * Parse a single NDJSON line from Claude Code's stream-json output.
  * Returns an array of normalized events (usually 1, sometimes 0).
  */
-function parseLine(line) {
+export function parseLine(line: string): ProbeEvent[] {
   line = line.trim();
   if (!line) return [];
 
-  let obj;
+  let obj: Record<string, unknown>;
   try {
     obj = JSON.parse(line);
   } catch {
     return [makeEvent('raw', { text: line })];
   }
 
-  const type = obj.type;
+  const type = obj.type as string;
 
   if (type === 'system') {
     return [makeEvent('init', {
@@ -36,11 +38,11 @@ function parseLine(line) {
   }
 
   if (type === 'assistant') {
-    return parseAssistantMessage(obj.message);
+    return parseAssistantMessage(obj.message as AssistantMessage);
   }
 
   if (type === 'user') {
-    return parseUserMessage(obj.message);
+    return parseUserMessage(obj.message as UserMessage);
   }
 
   if (type === 'result') {
@@ -56,16 +58,77 @@ function parseLine(line) {
   }
 
   if (type === 'stream_event') {
-    return parseStreamEvent(obj.event);
+    return parseStreamEvent(obj.event as StreamEvent);
   }
 
   // Unknown top-level type — pass through as raw
   return [makeEvent('raw', { data: obj })];
 }
 
-function parseAssistantMessage(msg) {
+// ================================================================
+// Internal types for Claude protocol messages
+// ================================================================
+
+interface ContentBlock {
+  type: string;
+  text?: string;
+  thinking?: string;
+  name?: string;
+  id?: string;
+  input?: unknown;
+}
+
+interface UsageInfo {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+interface AssistantMessage {
+  content?: ContentBlock[];
+  usage?: UsageInfo;
+}
+
+interface ToolResultBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: string | ContentBlock[];
+  is_error?: boolean;
+}
+
+interface UserMessage {
+  content?: string | (ContentBlock | ToolResultBlock)[];
+}
+
+interface StreamEvent {
+  type: string;
+  message?: {
+    id?: string;
+    model?: string;
+    role?: string;
+    usage?: UsageInfo;
+  };
+  content_block?: ContentBlock;
+  index?: number;
+  delta?: {
+    type?: string;
+    text?: string;
+    partial_json?: string;
+    thinking?: string;
+    signature?: string;
+    stop_reason?: string;
+  };
+  usage?: UsageInfo;
+}
+
+// ================================================================
+// Message parsers
+// ================================================================
+
+function parseAssistantMessage(msg: AssistantMessage): ProbeEvent[] {
   if (!msg || !msg.content) return [];
-  const events = [];
+  const events: ProbeEvent[] = [];
 
   for (const block of msg.content) {
     if (block.type === 'text') {
@@ -88,7 +151,6 @@ function parseAssistantMessage(msg) {
     }
   }
 
-  // Extract usage if present
   if (msg.usage) {
     events.push(makeEvent('usage', {
       inputTokens: msg.usage.input_tokens || 0,
@@ -101,24 +163,27 @@ function parseAssistantMessage(msg) {
   return events;
 }
 
-function parseUserMessage(msg) {
+function parseUserMessage(msg: UserMessage): ProbeEvent[] {
   if (!msg || !msg.content) return [];
-  const events = [];
+  const events: ProbeEvent[] = [];
 
-  const content = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: String(msg.content) }];
+  const content: (ContentBlock | ToolResultBlock)[] = Array.isArray(msg.content)
+    ? msg.content
+    : [{ type: 'text', text: String(msg.content) }];
 
   for (const block of content) {
     if (block.type === 'tool_result') {
-      const resultContent = typeof block.content === 'string'
-        ? block.content
-        : Array.isArray(block.content)
-          ? block.content.map(c => c.text || JSON.stringify(c)).join('\n')
-          : JSON.stringify(block.content);
+      const toolBlock = block as ToolResultBlock;
+      const resultContent = typeof toolBlock.content === 'string'
+        ? toolBlock.content
+        : Array.isArray(toolBlock.content)
+          ? toolBlock.content.map(c => c.text || JSON.stringify(c)).join('\n')
+          : JSON.stringify(toolBlock.content);
 
       events.push(makeEvent('tool_result', {
-        toolId: block.tool_use_id,
+        toolId: toolBlock.tool_use_id,
         content: resultContent,
-        isError: block.is_error || false,
+        isError: toolBlock.is_error || false,
       }));
     }
   }
@@ -126,13 +191,13 @@ function parseUserMessage(msg) {
   return events;
 }
 
-function parseStreamEvent(evt) {
+function parseStreamEvent(evt: StreamEvent): ProbeEvent[] {
   if (!evt) return [];
   const type = evt.type;
 
   if (type === 'message_start') {
     const msg = evt.message || {};
-    const events = [makeEvent('stream_message_start', {
+    const events: ProbeEvent[] = [makeEvent('stream_message_start', {
       messageId: msg.id,
       model: msg.model,
       role: msg.role,
@@ -149,7 +214,7 @@ function parseStreamEvent(evt) {
   }
 
   if (type === 'content_block_start') {
-    const block = evt.content_block || {};
+    const block = evt.content_block || {} as ContentBlock;
     const index = evt.index;
 
     if (block.type === 'text') {
@@ -201,7 +266,7 @@ function parseStreamEvent(evt) {
   }
 
   if (type === 'message_delta') {
-    const events = [];
+    const events: ProbeEvent[] = [];
     if (evt.delta) {
       events.push(makeEvent('stream_message_delta', {
         stopReason: evt.delta.stop_reason,
@@ -228,5 +293,3 @@ function parseStreamEvent(evt) {
 
   return [];
 }
-
-module.exports = { parseLine };

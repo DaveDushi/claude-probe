@@ -1,13 +1,64 @@
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
-const { spawn } = require('node:child_process');
-const { WebSocketServer } = require('ws');
-const { parseLine } = require('./parser');
-const { SessionState } = require('./state');
-const { SessionWatchdog } = require('./watchdog');
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn, ChildProcess } from 'node:child_process';
+import { WebSocketServer, WebSocket } from 'ws';
+import { parseLine } from './parser';
+import { SessionState, ProbeEvent, SessionSnapshot } from './state';
+import { SessionWatchdog } from './watchdog';
+import { SessionStore } from './store';
 
-const MIME_TYPES = {
+// ================================================================
+// Types
+// ================================================================
+
+export type SessionStatus = 'starting' | 'running' | 'waiting_approval' | 'idle' | 'done' | 'error';
+
+export interface PendingApproval {
+  requestId: string;
+  toolName: string;
+  input: unknown;
+  requestedAt: number;
+}
+
+export interface Session {
+  sessionId: string;
+  claudeSessionId: string | null;
+  process: ChildProcess | null;
+  ws: WebSocket | null;
+  state: SessionState;
+  status: SessionStatus;
+  pendingApproval: PendingApproval | null;
+  autoApprove: boolean;
+  promptQueue: string[];
+  gotResult: boolean;
+  error: string | null;
+  errorCode: string | null;
+  lastActivityAt: number;
+  prompt: string | null;
+  model: string | undefined;
+  cwd: string;
+}
+
+interface CreateSessionOpts {
+  prompt: string;
+  model?: string;
+  resumeSessionId?: string;
+  autoApprove?: boolean;
+  cwd?: string;
+  passthroughFlags?: string[];
+}
+
+interface IngestContext {
+  sessionId: string | null;
+  state: SessionState;
+}
+
+export interface ServerOptions {
+  claudePath?: string;
+}
+
+const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html',
   '.css': 'text/css',
   '.js': 'application/javascript',
@@ -17,38 +68,35 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon',
 };
 
-function findClaudeBinary() {
-  const fs2 = require('node:fs');
-  const candidates = [
-    // Common install locations
+function findClaudeBinary(): string {
+  const candidates: (string | undefined)[] = [
     process.env.CLAUDE_CLI_PATH,
     path.join(process.env.APPDATA || '', 'com.jean.desktop', 'claude-cli', 'claude.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'Programs', '@anthropic', 'claude-code', 'claude.exe'),
     path.join(process.env.APPDATA || '', 'npm', 'claude.cmd'),
     path.join(process.env.APPDATA || '', 'npm', 'claude'),
-    // Unix paths
     path.join(process.env.HOME || '', '.npm-global', 'bin', 'claude'),
     '/usr/local/bin/claude',
   ];
   for (const p of candidates) {
-    if (p && fs2.existsSync(p)) return p;
+    if (p && fs.existsSync(p)) return p;
   }
-  // Fallback: hope it's on PATH
   return 'claude';
 }
 
-function createServer(port, publicDir, store, opts) {
-  const claudeBinary = (opts && opts.claudePath) || findClaudeBinary();
+export function createServer(port: number, publicDir: string, store: SessionStore, opts?: ServerOptions) {
+  const claudeBinary = opts?.claudePath || findClaudeBinary();
+
   // --- Dashboard WebSocket clients (browsers) ---
-  const dashboardClients = new Set();
+  const dashboardClients = new Set<WebSocket>();
 
   // --- Active sessions: sessionId → session object ---
-  const activeSessions = new Map();
+  const activeSessions = new Map<string, Session>();
 
   // --- Session watchdog (timeout detection) ---
   const watchdog = new SessionWatchdog();
 
-  watchdog.onTimeout = (sessionId, reason, message) => {
+  watchdog.onTimeout = (sessionId: string, reason: string, message: string) => {
     const session = activeSessions.get(sessionId);
     if (!session) return;
     if (session.status === 'done' || session.status === 'error') return;
@@ -57,7 +105,7 @@ function createServer(port, publicDir, store, opts) {
     session.error = message;
     session.errorCode = reason;
 
-    const timeoutEvent = {
+    const timeoutEvent: ProbeEvent = {
       id: `evt_${Date.now()}_timeout`,
       ts: Date.now(),
       kind: 'session_timeout',
@@ -70,41 +118,41 @@ function createServer(port, publicDir, store, opts) {
     broadcastSessionStatus(session);
 
     if (session.process) {
-      try { session.process.kill(); } catch {}
+      try { session.process.kill(); } catch { /* ignore */ }
     }
     if (session.ws) {
-      try { session.ws.close(); } catch {}
+      try { session.ws.close(); } catch { /* ignore */ }
     }
   };
 
   // --- Legacy ingest support (pipe mode) ---
-  const ingestSessions = new Map();
-  let activeConnectionId = null;
-  const pendingPrompts = new Map(); // legacy token → { prompt }
+  const ingestSessions = new Map<string, IngestContext>();
+  let activeConnectionId: string | null = null;
+  const pendingPrompts = new Map<string, { prompt: string }>();
 
   // ================================================================
   // Session management
   // ================================================================
 
-  function createSession(opts) {
+  function createSession(opts: CreateSessionOpts): string {
     const { prompt, model, resumeSessionId, autoApprove, cwd, passthroughFlags } = opts;
     const sessionId = store.generateSessionId();
 
-    const session = {
+    const session: Session = {
       sessionId,
       claudeSessionId: null,
       process: null,
       ws: null,
       state: new SessionState(),
-      status: 'starting',    // starting | running | waiting_approval | idle | done | error
-      pendingApproval: null,  // { requestId, toolName, input }
+      status: 'starting',
+      pendingApproval: null,
       autoApprove: autoApprove || false,
-      promptQueue: [],        // queued follow-up prompts
-      gotResult: false,       // set after result, cleared on new prompt
+      promptQueue: [],
+      gotResult: false,
       error: null,
-      errorCode: null,        // structured: startup_timeout, heartbeat_timeout, etc.
+      errorCode: null,
       lastActivityAt: Date.now(),
-      prompt,                 // initial prompt (consumed on first connect)
+      prompt,
       model,
       cwd: cwd || process.cwd(),
     };
@@ -112,8 +160,7 @@ function createServer(port, publicDir, store, opts) {
     activeSessions.set(sessionId, session);
     watchdog.trackStarting(sessionId);
 
-    // Emit session_start event with metadata
-    const startEvent = {
+    const startEvent: ProbeEvent = {
       id: `evt_${Date.now()}_start`,
       ts: Date.now(),
       kind: 'session_start',
@@ -128,7 +175,7 @@ function createServer(port, publicDir, store, opts) {
 
     // Build Claude CLI args
     const wsUrl = `ws://localhost:${port}/ws?session=${sessionId}`;
-    const claudeArgs = [
+    const claudeArgs: string[] = [
       '--sdk-url', wsUrl,
       '--output-format', 'stream-json',
       '--input-format', 'stream-json',
@@ -139,8 +186,6 @@ function createServer(port, publicDir, store, opts) {
     if (resumeSessionId) claudeArgs.push('--resume', resumeSessionId);
     if (model) claudeArgs.push('--model', model);
 
-    // Default permission mode: bypass internal checks when autoApprove
-    // (probe handles permissions at the SDK level via control_request/response)
     const hasPermFlag = passthroughFlags &&
       (passthroughFlags.includes('--permission-mode') || passthroughFlags.includes('--dangerously-skip-permissions'));
     if (autoApprove && !hasPermFlag) {
@@ -164,10 +209,10 @@ function createServer(port, publicDir, store, opts) {
 
     session.process = child;
 
-    child.stderr.on('data', () => {}); // drain stderr
-    child.stdout.on('data', () => {}); // drain stdout
+    child.stderr!.on('data', () => {}); // drain stderr
+    child.stdout!.on('data', () => {}); // drain stdout
 
-    child.on('error', (err) => {
+    child.on('error', (err: Error) => {
       watchdog.untrack(session.sessionId);
       session.status = 'error';
       session.errorCode = 'spawn_error';
@@ -175,7 +220,7 @@ function createServer(port, publicDir, store, opts) {
       broadcastSessionStatus(session);
     });
 
-    child.on('exit', (code) => {
+    child.on('exit', () => {
       watchdog.untrack(session.sessionId);
       if (session.status !== 'error') {
         session.status = 'done';
@@ -186,11 +231,11 @@ function createServer(port, publicDir, store, opts) {
     return sessionId;
   }
 
-  function getSession(sessionId) {
+  function getSession(sessionId: string): Session | null {
     return activeSessions.get(sessionId) || null;
   }
 
-  function killSession(sessionId) {
+  function killSession(sessionId: string): boolean {
     const session = activeSessions.get(sessionId);
     if (!session) return false;
     if (session.process) {
@@ -206,12 +251,11 @@ function createServer(port, publicDir, store, opts) {
     return true;
   }
 
-  function sendPromptToSession(session, prompt) {
-    if (!session.ws || session.ws.readyState !== 1) {
+  function sendPromptToSession(session: Session, prompt: string): void {
+    if (!session.ws || session.ws.readyState !== WebSocket.OPEN) {
       session.promptQueue.push(prompt);
       return;
     }
-    // Only send if CLI is idle (ready for next turn)
     if (session.status === 'idle') {
       const userMsg = JSON.stringify({
         type: 'user',
@@ -229,8 +273,8 @@ function createServer(port, publicDir, store, opts) {
     }
   }
 
-  function emitUserMessage(session, prompt) {
-    const event = {
+  function emitUserMessage(session: Session, prompt: string): void {
+    const event: ProbeEvent = {
       id: `evt_${Date.now()}_user`,
       ts: Date.now(),
       kind: 'user_message',
@@ -241,7 +285,7 @@ function createServer(port, publicDir, store, opts) {
     broadcastToDashboard(event, session.sessionId);
   }
 
-  function approveSession(session) {
+  function approveSession(session: Session): boolean {
     if (!session.pendingApproval || !session.ws) return false;
     const response = JSON.stringify({
       type: 'control_response',
@@ -253,7 +297,7 @@ function createServer(port, publicDir, store, opts) {
     }) + '\n';
     session.ws.send(response);
 
-    const grantedEvent = {
+    const grantedEvent: ProbeEvent = {
       id: `evt_${Date.now()}_approved`,
       ts: Date.now(),
       kind: 'approval_granted',
@@ -271,7 +315,7 @@ function createServer(port, publicDir, store, opts) {
     return true;
   }
 
-  function denySession(session, message) {
+  function denySession(session: Session, message: string): boolean {
     if (!session.pendingApproval || !session.ws) return false;
     const response = JSON.stringify({
       type: 'control_response',
@@ -283,7 +327,7 @@ function createServer(port, publicDir, store, opts) {
     }) + '\n';
     session.ws.send(response);
 
-    const deniedEvent = {
+    const deniedEvent: ProbeEvent = {
       id: `evt_${Date.now()}_denied`,
       ts: Date.now(),
       kind: 'approval_denied',
@@ -306,16 +350,15 @@ function createServer(port, publicDir, store, opts) {
   // Event handling
   // ================================================================
 
-  function getOrCreateIngest(connectionId) {
-    if (ingestSessions.has(connectionId)) return ingestSessions.get(connectionId);
-    const ctx = { sessionId: null, state: new SessionState() };
+  function getOrCreateIngest(connectionId: string): IngestContext {
+    if (ingestSessions.has(connectionId)) return ingestSessions.get(connectionId)!;
+    const ctx: IngestContext = { sessionId: null, state: new SessionState() };
     ingestSessions.set(connectionId, ctx);
     activeConnectionId = connectionId;
     return ctx;
   }
 
-  function handleIngestEvents(connectionId, events, session) {
-    // Use session if provided (new mode), else legacy ingest
+  function handleIngestEvents(connectionId: string, events: ProbeEvent[], session?: Session): void {
     const ctx = session
       ? { sessionId: session.sessionId, state: session.state }
       : getOrCreateIngest(connectionId);
@@ -323,14 +366,13 @@ function createServer(port, publicDir, store, opts) {
     for (const event of events) {
       if (event.kind === 'init' && event.sessionId) {
         if (!session) {
-          // Legacy mode: handle resume
-          if (store.hasSession(event.sessionId)) {
-            ctx.sessionId = event.sessionId;
+          if (store.hasSession(event.sessionId as string)) {
+            ctx.sessionId = event.sessionId as string;
             const existing = store.loadSession(ctx.sessionId);
             if (existing) {
               for (const e of existing) ctx.state.addEvent(e);
             }
-            const resumeEvent = {
+            const resumeEvent: ProbeEvent = {
               id: `evt_${Date.now()}_resume`,
               ts: Date.now(),
               kind: 'session_resumed',
@@ -340,11 +382,11 @@ function createServer(port, publicDir, store, opts) {
             store.appendEvent(ctx.sessionId, resumeEvent);
             broadcastToDashboard(resumeEvent, ctx.sessionId);
           } else {
-            ctx.sessionId = event.sessionId;
+            ctx.sessionId = event.sessionId as string;
           }
         }
         if (session) {
-          session.claudeSessionId = event.sessionId;
+          session.claudeSessionId = event.sessionId as string;
         }
       }
 
@@ -359,11 +401,11 @@ function createServer(port, publicDir, store, opts) {
     }
   }
 
-  function closeIngest(connectionId) {
+  function closeIngest(connectionId: string): string | null {
     const ctx = ingestSessions.get(connectionId);
     if (!ctx) return null;
 
-    const endEvent = {
+    const endEvent: ProbeEvent = {
       id: `evt_${Date.now()}_end`,
       ts: Date.now(),
       kind: 'session_complete',
@@ -379,7 +421,7 @@ function createServer(port, publicDir, store, opts) {
     ingestSessions.delete(connectionId);
     if (activeConnectionId === connectionId) {
       activeConnectionId = ingestSessions.size > 0
-        ? [...ingestSessions.keys()].pop()
+        ? [...ingestSessions.keys()].pop()!
         : null;
     }
     return sessionId;
@@ -389,35 +431,32 @@ function createServer(port, publicDir, store, opts) {
   // Broadcasting
   // ================================================================
 
-  function getSnapshot(sessionId) {
-    // If specific session requested
+  function getSnapshot(sessionId?: string): SessionSnapshot | null {
     if (sessionId) {
       const session = activeSessions.get(sessionId);
       if (session) return session.state.getSnapshot();
       return null;
     }
-    // Default: most recent active session, or legacy
     for (const [, session] of [...activeSessions].reverse()) {
       if (session.status !== 'done') return session.state.getSnapshot();
     }
     if (activeConnectionId && ingestSessions.has(activeConnectionId)) {
-      return ingestSessions.get(activeConnectionId).state.getSnapshot();
+      return ingestSessions.get(activeConnectionId)!.state.getSnapshot();
     }
-    // Return most recent active session even if done
     if (activeSessions.size > 0) {
-      return [...activeSessions.values()].pop().state.getSnapshot();
+      return [...activeSessions.values()].pop()!.state.getSnapshot();
     }
     return null;
   }
 
-  function broadcastToDashboard(event, sessionId) {
+  function broadcastToDashboard(event: ProbeEvent, sessionId: string | null): void {
     const msg = JSON.stringify({ type: 'event', data: event, sessionId });
     for (const ws of dashboardClients) {
-      if (ws.readyState === 1) ws.send(msg);
+      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
     }
   }
 
-  function broadcastSessionStatus(session) {
+  function broadcastSessionStatus(session: Session): void {
     const msg = JSON.stringify({
       type: 'session_status',
       sessionId: session.sessionId,
@@ -425,7 +464,7 @@ function createServer(port, publicDir, store, opts) {
       pendingApproval: session.pendingApproval,
     });
     for (const ws of dashboardClients) {
-      if (ws.readyState === 1) ws.send(msg);
+      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
     }
   }
 
@@ -433,22 +472,21 @@ function createServer(port, publicDir, store, opts) {
   // HTTP helpers
   // ================================================================
 
-  function readBody(req) {
+  function readBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
-      const chunks = [];
-      req.on('data', c => chunks.push(c));
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
       req.on('end', () => resolve(Buffer.concat(chunks).toString()));
       req.on('error', reject);
     });
   }
 
-  function json(res, status, data) {
+  function json(res: http.ServerResponse, status: number, data: unknown): void {
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
   }
 
-  function parseRoute(urlPath) {
-    // /api/sessions/:id/:action
+  function parseRoute(urlPath: string): { id: string; action: string | null } | null {
     const m = urlPath.match(/^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/);
     if (m) return { id: decodeURIComponent(m[1]), action: m[2] || null };
     return null;
@@ -459,7 +497,7 @@ function createServer(port, publicDir, store, opts) {
   // ================================================================
 
   const httpServer = http.createServer(async (req, res) => {
-    const [urlPath] = req.url.split('?');
+    const [urlPath] = req.url!.split('?');
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -477,7 +515,7 @@ function createServer(port, publicDir, store, opts) {
       const sessions = [];
       for (const [id, session] of activeSessions) {
         const processAlive = !!(session.process && !session.process.killed && session.process.exitCode === null);
-        const wsConnected = !!(session.ws && session.ws.readyState === 1);
+        const wsConnected = !!(session.ws && session.ws.readyState === WebSocket.OPEN);
         sessions.push({
           sessionId: id,
           status: session.status,
@@ -503,14 +541,11 @@ function createServer(port, publicDir, store, opts) {
 
     // --- Shutdown ---
     if (urlPath === '/api/shutdown' && req.method === 'POST') {
-      // Kill all active sessions
       for (const [id] of activeSessions) killSession(id);
       json(res, 200, { ok: true });
-      // Close all WebSocket connections, then the HTTP server, then exit
       wss.clients.forEach(c => c.close());
       wss.close(() => {
         httpServer.close(() => process.exit(0));
-        // Force exit if connections linger
         setTimeout(() => process.exit(0), 1000);
       });
       return;
@@ -530,8 +565,8 @@ function createServer(port, publicDir, store, opts) {
           passthroughFlags: body.flags,
         });
         json(res, 200, { sessionId });
-      } catch (err) {
-        json(res, 400, { error: err.message });
+      } catch (err: unknown) {
+        json(res, 400, { error: (err as Error).message });
       }
       return;
     }
@@ -539,7 +574,6 @@ function createServer(port, publicDir, store, opts) {
     // --- List sessions ---
     if (urlPath === '/api/sessions' && req.method === 'GET') {
       const stored = store.listSessions();
-      // Merge active session status
       for (const s of stored) {
         const active = [...activeSessions.values()].find(a => a.sessionId === s.id);
         if (active) {
@@ -548,7 +582,6 @@ function createServer(port, publicDir, store, opts) {
           s.cwd = active.cwd;
         }
       }
-      // Add active sessions not yet stored
       for (const [id, active] of activeSessions) {
         if (!stored.find(s => s.id === id)) {
           stored.unshift({
@@ -556,6 +589,13 @@ function createServer(port, publicDir, store, opts) {
             claudeSessionId: active.claudeSessionId,
             model: active.model || active.state.model,
             startTime: active.state.startTime,
+            costUsd: null,
+            durationMs: null,
+            numTurns: null,
+            isError: false,
+            toolCalls: 0,
+            fileSize: 0,
+            preview: null,
             status: active.status,
             pendingApproval: active.pendingApproval,
             eventCount: active.state.events.length,
@@ -573,7 +613,6 @@ function createServer(port, publicDir, store, opts) {
     if (route) {
       const { id, action } = route;
 
-      // GET /api/sessions/:id → load stored events (existing behavior)
       if (!action && req.method === 'GET') {
         const events = store.loadSession(id);
         if (!events) { json(res, 404, { error: 'Session not found' }); return; }
@@ -588,7 +627,6 @@ function createServer(port, publicDir, store, opts) {
         return;
       }
 
-      // DELETE /api/sessions/:id (kills + deletes stored data)
       if (!action && req.method === 'DELETE') {
         killSession(id);
         const deleted = store.deleteSession(id);
@@ -596,11 +634,9 @@ function createServer(port, publicDir, store, opts) {
         return;
       }
 
-      // GET /api/sessions/:id/status
       if (action === 'status' && req.method === 'GET') {
         const session = activeSessions.get(id);
         if (!session) {
-          // Check stored sessions
           if (store.hasSession(id)) {
             json(res, 200, { sessionId: id, status: 'done' });
           } else {
@@ -611,7 +647,7 @@ function createServer(port, publicDir, store, opts) {
         const s = session.state;
         const toolCalls = s.events.filter(e => e.kind === 'tool_call' || (e.kind === 'block_start' && e.blockType === 'tool_use')).length;
         const isTerminal = session.status === 'done' || session.status === 'error';
-        const result = {
+        const result: Record<string, unknown> = {
           sessionId: id,
           claudeSessionId: session.claudeSessionId,
           status: session.status,
@@ -639,57 +675,52 @@ function createServer(port, publicDir, store, opts) {
         return;
       }
 
-      // GET /api/sessions/:id/events?last=N&since=cursor
       if (action === 'events' && req.method === 'GET') {
         const session = activeSessions.get(id);
-        const reqUrl = new URL(req.url, `http://localhost:${port}`);
-        const last = parseInt(reqUrl.searchParams.get('last')) || 0;
-        const since = reqUrl.searchParams.get('since'); // event ID
+        const reqUrl = new URL(req.url!, `http://localhost:${port}`);
+        const last = parseInt(reqUrl.searchParams.get('last') || '0') || 0;
+        const since = reqUrl.searchParams.get('since');
 
-        let events;
+        let events: ProbeEvent[];
         if (session) {
           events = session.state.events;
         } else {
-          events = store.loadSession(id);
-          if (!events) { json(res, 404, { error: 'Session not found' }); return; }
+          const loaded = store.loadSession(id);
+          if (!loaded) { json(res, 404, { error: 'Session not found' }); return; }
+          events = loaded;
         }
 
-        // Filter by cursor
         if (since) {
           const idx = events.findIndex(e => e.id === since);
           if (idx !== -1) events = events.slice(idx + 1);
         }
 
-        // Limit
         if (last > 0) events = events.slice(-last);
 
         json(res, 200, { sessionId: id, events });
         return;
       }
 
-      // GET /api/sessions/:id/result
       if (action === 'result' && req.method === 'GET') {
         const session = activeSessions.get(id);
-        let events;
+        let events: ProbeEvent[];
         if (session) {
           events = session.state.events;
         } else {
-          events = store.loadSession(id);
-          if (!events) { json(res, 404, { error: 'Session not found' }); return; }
+          const loaded = store.loadSession(id);
+          if (!loaded) { json(res, 404, { error: 'Session not found' }); return; }
+          events = loaded;
         }
-        // Find last session_end event
         const endEvent = [...events].reverse().find(e => e.kind === 'session_end');
         if (endEvent) {
           json(res, 200, { sessionId: id, result: endEvent.result, costUsd: endEvent.costUsd, isError: endEvent.isError });
         } else {
-          // Collect text from text events
           const texts = events.filter(e => e.kind === 'text').map(e => e.text);
-          json(res, 200, { sessionId: id, result: texts.join('') || null, status: session ? session.status : 'done' });
+          json(res, 200, { sessionId: id, result: (texts.join('') as string) || null, status: session ? session.status : 'done' });
         }
         return;
       }
 
-      // POST /api/sessions/:id/message
       if (action === 'message' && req.method === 'POST') {
         const session = activeSessions.get(id);
         if (!session) { json(res, 404, { error: 'Session not found or not active' }); return; }
@@ -698,13 +729,12 @@ function createServer(port, publicDir, store, opts) {
           if (!body.prompt) { json(res, 400, { error: 'prompt required' }); return; }
           sendPromptToSession(session, body.prompt);
           json(res, 200, { sent: true, status: session.status });
-        } catch (err) {
-          json(res, 400, { error: err.message });
+        } catch (err: unknown) {
+          json(res, 400, { error: (err as Error).message });
         }
         return;
       }
 
-      // POST /api/sessions/:id/approve
       if (action === 'approve' && req.method === 'POST') {
         const session = activeSessions.get(id);
         if (!session) { json(res, 404, { error: 'Session not found or not active' }); return; }
@@ -714,11 +744,9 @@ function createServer(port, publicDir, store, opts) {
         return;
       }
 
-      // POST /api/sessions/:id/close (kill process + socket, keep stored data)
       if (action === 'close' && req.method === 'POST') {
         const killed = killSession(id);
         if (!killed) {
-          // Already done or not active — that's fine
           if (store.hasSession(id)) {
             json(res, 200, { closed: true, wasActive: false });
           } else {
@@ -730,49 +758,48 @@ function createServer(port, publicDir, store, opts) {
         return;
       }
 
-      // POST /api/sessions/:id/deny
       if (action === 'deny' && req.method === 'POST') {
         const session = activeSessions.get(id);
         if (!session) { json(res, 404, { error: 'Session not found or not active' }); return; }
         if (!session.pendingApproval) { json(res, 400, { error: 'No pending approval' }); return; }
         let message = '';
-        try { message = JSON.parse(await readBody(req)).message || ''; } catch {}
+        try { message = JSON.parse(await readBody(req)).message || ''; } catch { /* ignore */ }
         denySession(session, message);
         json(res, 200, { denied: true });
         return;
       }
     }
 
-    // --- Legacy: queue-prompt (for old send mode) ---
+    // --- Legacy: queue-prompt ---
     if (urlPath === '/api/queue-prompt' && req.method === 'POST') {
       try {
         const body = JSON.parse(await readBody(req));
         const token = `tok_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         pendingPrompts.set(token, { prompt: body.prompt || '' });
         json(res, 200, { token });
-      } catch (err) {
-        json(res, 400, { error: err.message });
+      } catch (err: unknown) {
+        json(res, 400, { error: (err as Error).message });
       }
       return;
     }
 
     // --- Legacy: ingest API (pipe mode) ---
     if (urlPath === '/api/ingest' && req.method === 'POST') {
-      const connectionId = req.headers['x-connection-id'];
+      const connectionId = req.headers['x-connection-id'] as string;
       if (!connectionId) { json(res, 400, { error: 'Missing X-Connection-Id header' }); return; }
       try {
         const body = await readBody(req);
         const events = parseLine(body.trim());
         handleIngestEvents(connectionId, events);
         json(res, 200, { ok: true });
-      } catch (err) {
-        json(res, 500, { error: err.message });
+      } catch (err: unknown) {
+        json(res, 500, { error: (err as Error).message });
       }
       return;
     }
 
     if (urlPath === '/api/ingest/close' && req.method === 'POST') {
-      const connectionId = req.headers['x-connection-id'];
+      const connectionId = req.headers['x-connection-id'] as string;
       if (!connectionId) { json(res, 400, { error: 'Missing X-Connection-Id header' }); return; }
       const sessionId = closeIngest(connectionId);
       json(res, 200, { closed: true, sessionId });
@@ -804,10 +831,9 @@ function createServer(port, publicDir, store, opts) {
 
   const wss = new WebSocketServer({ server: httpServer });
 
-  wss.on('connection', (ws, req) => {
+  wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     const reqUrl = new URL(req.url || '/', `http://localhost:${port}`);
 
-    // Claude CLI --sdk-url connection
     if (reqUrl.pathname === '/ws') {
       handleClaudeWs(ws, reqUrl);
       return;
@@ -827,12 +853,11 @@ function createServer(port, publicDir, store, opts) {
   // Claude CLI WebSocket handler
   // ================================================================
 
-  function handleClaudeWs(ws, reqUrl) {
+  function handleClaudeWs(ws: WebSocket, reqUrl: URL): void {
     const sessionId = reqUrl.searchParams.get('session');
     const token = reqUrl.searchParams.get('token');
 
-    // Match to active session or legacy token
-    let session = sessionId ? activeSessions.get(sessionId) : null;
+    let session = sessionId ? activeSessions.get(sessionId) || null : null;
     const legacyPromptData = token ? pendingPrompts.get(token) : null;
     if (token) pendingPrompts.delete(token);
 
@@ -841,7 +866,6 @@ function createServer(port, publicDir, store, opts) {
     if (session) {
       session.ws = ws;
 
-      // Send the initial prompt immediately (protocol: server sends user msg first)
       if (session.prompt) {
         const promptText = session.prompt;
         const userMsg = JSON.stringify({
@@ -851,7 +875,7 @@ function createServer(port, publicDir, store, opts) {
           session_id: session.claudeSessionId || '',
         }) + '\n';
         ws.send(userMsg);
-        session.prompt = null; // consumed
+        session.prompt = null;
         session.status = 'running';
         session.gotResult = false;
         watchdog.trackRunning(session.sessionId);
@@ -859,7 +883,6 @@ function createServer(port, publicDir, store, opts) {
         emitUserMessage(session, promptText);
       }
     } else if (legacyPromptData && legacyPromptData.prompt) {
-      // Legacy mode: send prompt immediately on connect
       const userMsg = JSON.stringify({
         type: 'user',
         message: { role: 'user', content: legacyPromptData.prompt },
@@ -869,55 +892,55 @@ function createServer(port, publicDir, store, opts) {
       ws.send(userMsg);
     }
 
-    ws.on('message', (data) => {
+    ws.on('message', (data: Buffer | string) => {
       const raw = data.toString();
       const lines = raw.split('\n').filter(l => l.trim());
 
       for (const line of lines) {
-        let obj;
+        let obj: Record<string, unknown>;
         try { obj = JSON.parse(line); } catch { continue; }
 
         // --- Handle control_request (permission) ---
-        if (obj.type === 'control_request' && obj.request && obj.request.subtype === 'can_use_tool') {
-          if (session && !session.autoApprove) {
-            // Queue for external approval
-            session.pendingApproval = {
-              requestId: obj.request_id,
-              toolName: obj.request.tool_name,
-              input: obj.request.tool_input,
-              requestedAt: Date.now(),
-            };
-            session.status = 'waiting_approval';
-            watchdog.trackApprovalWaiting(session.sessionId);
-            broadcastSessionStatus(session);
+        if (obj.type === 'control_request') {
+          const request = obj.request as Record<string, unknown> | undefined;
+          if (request && request.subtype === 'can_use_tool') {
+            if (session && !session.autoApprove) {
+              session.pendingApproval = {
+                requestId: obj.request_id as string,
+                toolName: request.tool_name as string,
+                input: request.tool_input,
+                requestedAt: Date.now(),
+              };
+              session.status = 'waiting_approval';
+              watchdog.trackApprovalWaiting(session.sessionId);
+              broadcastSessionStatus(session);
 
-            // Also broadcast as event for dashboard timeline
-            const approvalEvent = {
-              id: `evt_${Date.now()}_approval`,
-              ts: Date.now(),
-              kind: 'approval_request',
-              toolName: obj.request.tool_name,
-              input: obj.request.tool_input,
-              requestId: obj.request_id,
-            };
-            if (session) {
-              session.state.addEvent(approvalEvent);
-              store.appendEvent(session.sessionId, approvalEvent);
-              broadcastToDashboard(approvalEvent, session.sessionId);
+              const approvalEvent: ProbeEvent = {
+                id: `evt_${Date.now()}_approval`,
+                ts: Date.now(),
+                kind: 'approval_request',
+                toolName: request.tool_name as string,
+                input: request.tool_input,
+                requestId: obj.request_id as string,
+              };
+              if (session) {
+                session.state.addEvent(approvalEvent);
+                store.appendEvent(session.sessionId, approvalEvent);
+                broadcastToDashboard(approvalEvent, session.sessionId);
+              }
+            } else {
+              const response = JSON.stringify({
+                type: 'control_response',
+                request_id: obj.request_id,
+                response: {
+                  behavior: 'allow',
+                  updatedInput: request.tool_input,
+                },
+              }) + '\n';
+              ws.send(response);
             }
-          } else {
-            // Auto-approve
-            const response = JSON.stringify({
-              type: 'control_response',
-              request_id: obj.request_id,
-              response: {
-                behavior: 'allow',
-                updatedInput: obj.request.tool_input,
-              },
-            }) + '\n';
-            ws.send(response);
+            continue;
           }
-          continue;
         }
 
         // --- Ignore keep_alive ---
@@ -925,7 +948,7 @@ function createServer(port, publicDir, store, opts) {
 
         // --- Parse and ingest ---
         const events = parseLine(line);
-        handleIngestEvents(connectionId, events, session);
+        handleIngestEvents(connectionId, events, session || undefined);
 
         // --- Watchdog: track activity ---
         if (session && events.length > 0) {
@@ -935,28 +958,24 @@ function createServer(port, publicDir, store, opts) {
 
         // --- Track session state ---
         if (session) {
-          if (obj.type === 'system' && obj.subtype === 'init') {
-            session.claudeSessionId = obj.session_id;
+          if (obj.type === 'system' && (obj as Record<string, unknown>).subtype === 'init') {
+            session.claudeSessionId = obj.session_id as string;
 
-            // If idle with queued prompts, send next
             if (session.status === 'idle' && session.promptQueue.length > 0) {
-              const nextPrompt = session.promptQueue.shift();
+              const nextPrompt = session.promptQueue.shift()!;
               sendPromptToSession(session, nextPrompt);
             }
           }
 
           if (obj.type === 'result') {
-            // Turn complete — transition to idle
             session.status = 'idle';
             broadcastSessionStatus(session);
 
-            // Send queued prompt if any
             if (session.promptQueue.length > 0) {
-              // Small delay to let CLI settle before next turn
               setTimeout(() => {
-                if (session.status === 'idle' && session.promptQueue.length > 0) {
-                  const nextPrompt = session.promptQueue.shift();
-                  sendPromptToSession(session, nextPrompt);
+                if (session!.status === 'idle' && session!.promptQueue.length > 0) {
+                  const nextPrompt = session!.promptQueue.shift()!;
+                  sendPromptToSession(session!, nextPrompt);
                 }
               }, 500);
             }
@@ -972,8 +991,7 @@ function createServer(port, publicDir, store, opts) {
         if (session.status !== 'error') {
           session.status = 'done';
         }
-        // Emit session_complete event
-        const endEvent = {
+        const endEvent: ProbeEvent = {
           id: `evt_${Date.now()}_end`,
           ts: Date.now(),
           kind: 'session_complete',
@@ -984,7 +1002,6 @@ function createServer(port, publicDir, store, opts) {
         broadcastToDashboard(endEvent, session.sessionId);
         broadcastSessionStatus(session);
       } else {
-        // Legacy mode
         closeIngest(connectionId);
       }
     });
@@ -994,13 +1011,14 @@ function createServer(port, publicDir, store, opts) {
 
   // ================================================================
 
-  function start() {
+  function start(): Promise<void> {
     return new Promise((resolve) => {
       httpServer.listen(port, '0.0.0.0', () => resolve());
     });
   }
 
+  // Suppress unused variable warnings — getSession is part of the public API
+  void getSession;
+
   return { start, broadcastToDashboard, getSnapshot, httpServer, watchdog };
 }
-
-module.exports = { createServer };
