@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawn, ChildProcess } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 import { parseLine } from './parser';
-import { SessionState, ProbeEvent, SessionSnapshot } from './state';
+import { SessionState, ProbeEvent, SessionSnapshot, Artifact, extractArtifacts } from './state';
 import { SessionWatchdog } from './watchdog';
 import { SessionStore } from './store';
 import {
@@ -44,6 +44,9 @@ export interface Session {
   model: string | undefined;
   cwd: string;
   limits: SessionLimits;
+  parentSessionId: string | null;
+  spawnReason: string | null;
+  childSessionIds: string[];
 }
 
 interface CreateSessionOpts {
@@ -54,6 +57,8 @@ interface CreateSessionOpts {
   cwd?: string;
   passthroughFlags?: string[];
   limits?: Partial<SessionLimits>;
+  parentSessionId?: string;
+  spawnReason?: string;
 }
 
 interface IngestContext {
@@ -232,7 +237,16 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       model,
       cwd: cwd || process.cwd(),
       limits: sessionLimits,
+      parentSessionId: opts.parentSessionId || null,
+      spawnReason: opts.spawnReason || null,
+      childSessionIds: [],
     };
+
+    // Register as child on parent
+    if (opts.parentSessionId) {
+      const parent = activeSessions.get(opts.parentSessionId);
+      if (parent) parent.childSessionIds.push(sessionId);
+    }
 
     activeSessions.set(sessionId, session);
     watchdog.trackStarting(sessionId);
@@ -245,6 +259,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       prompt: prompt ? prompt.slice(0, 300) : '',
       model: model || null,
       autoApprove: session.autoApprove,
+      parentSessionId: session.parentSessionId,
+      spawnReason: session.spawnReason,
     };
     session.state.addEvent(startEvent);
     store.appendEvent(sessionId, startEvent);
@@ -313,9 +329,25 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     return activeSessions.get(sessionId) || null;
   }
 
-  function killSession(sessionId: string): boolean {
+  function killSession(sessionId: string, tree?: boolean): boolean {
     const session = activeSessions.get(sessionId);
     if (!session) return false;
+
+    // Recursively kill children first if tree mode
+    if (tree) {
+      for (const childId of [...session.childSessionIds]) {
+        killSession(childId, true);
+      }
+    }
+
+    // Remove from parent's child list
+    if (session.parentSessionId) {
+      const parent = activeSessions.get(session.parentSessionId);
+      if (parent) {
+        parent.childSessionIds = parent.childSessionIds.filter(id => id !== sessionId);
+      }
+    }
+
     if (session.process) {
       session.process.kill();
     }
@@ -579,6 +611,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       sessionId: session.sessionId,
       status: session.status,
       pendingApproval: session.pendingApproval,
+      parentSessionId: session.parentSessionId,
+      childSessionIds: session.childSessionIds,
     });
     for (const ws of dashboardClients) {
       if (ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -683,6 +717,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           cwd: body.cwd,
           passthroughFlags: body.flags,
           limits: body.limits,
+          parentSessionId: body.parentSessionId,
+          spawnReason: body.spawnReason,
         });
         json(res, 200, { sessionId });
       } catch (err: unknown) {
@@ -703,7 +739,12 @@ export function createServer(port: number, publicDir: string, store: SessionStor
         }
       }
       for (const [id, active] of activeSessions) {
-        if (!stored.find(s => s.id === id)) {
+        const existing = stored.find(s => s.id === id);
+        if (existing) {
+          // Enrich stored summary with live hierarchy + artifact data
+          existing.parentSessionId = active.parentSessionId;
+          existing.artifactCount = active.state.artifacts.length;
+        } else {
           stored.unshift({
             id,
             claudeSessionId: active.claudeSessionId,
@@ -721,6 +762,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
             eventCount: active.state.events.length,
             ended: active.status === 'done' || active.status === 'error',
             cwd: active.cwd,
+            parentSessionId: active.parentSessionId,
+            artifactCount: active.state.artifacts.length,
           });
         }
       }
@@ -743,6 +786,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           status: session ? session.status : 'done',
           pendingApproval: session ? session.pendingApproval : null,
           cwd: session ? session.cwd : null,
+          parentSessionId: session ? session.parentSessionId : null,
+          childSessionIds: session ? session.childSessionIds : [],
         });
         return;
       }
@@ -789,6 +834,10 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           startedAt: s.startTime,
           turns: session.state.turns,
           limits: session.limits,
+          parentSessionId: session.parentSessionId,
+          childSessionIds: session.childSessionIds,
+          spawnReason: session.spawnReason,
+          artifactCount: session.state.artifacts.length,
         };
         if (session.pendingApproval) {
           result.pendingApproval = session.pendingApproval;
@@ -843,6 +892,28 @@ export function createServer(port: number, publicDir: string, store: SessionStor
         return;
       }
 
+      if (action === 'artifacts' && req.method === 'GET') {
+        const session = activeSessions.get(id);
+        let artifacts: Artifact[];
+        if (session) {
+          artifacts = session.state.artifacts;
+        } else {
+          const events = store.loadSession(id);
+          if (!events) { json(res, 404, { error: 'Session not found' }); return; }
+          // Recompute artifacts from stored events
+          artifacts = [];
+          for (const evt of events) {
+            if (evt.kind === 'tool_call') {
+              artifacts.push(...extractArtifacts(
+                evt.toolName as string, evt.toolId as string, evt.input, evt.ts,
+              ));
+            }
+          }
+        }
+        json(res, 200, { sessionId: id, artifacts });
+        return;
+      }
+
       if (action === 'message' && req.method === 'POST') {
         const session = activeSessions.get(id);
         if (!session) { json(res, 404, { error: 'Session not found or not active' }); return; }
@@ -867,7 +938,9 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       }
 
       if (action === 'close' && req.method === 'POST') {
-        const killed = killSession(id);
+        let tree = false;
+        try { tree = JSON.parse(await readBody(req)).tree === true; } catch { /* ignore */ }
+        const killed = killSession(id, tree);
         if (!killed) {
           if (store.hasSession(id)) {
             json(res, 200, { closed: true, wasActive: false });
@@ -876,7 +949,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           }
           return;
         }
-        json(res, 200, { closed: true, wasActive: true });
+        json(res, 200, { closed: true, wasActive: true, tree });
         return;
       }
 

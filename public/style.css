@@ -235,6 +235,47 @@ main {
   font-size: 12px;
 }
 
+/* Artifacts panel */
+.artifacts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.artifact-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.artifact-row:hover {
+  background: var(--bg-tertiary);
+}
+
+.artifact-op {
+  font-weight: bold;
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.artifact-created { color: var(--accent-result); }
+.artifact-modified { color: var(--accent-system); }
+.artifact-read { color: var(--text-muted); }
+
+.artifact-path {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Chat timeline */
 #timeline {
   max-width: 900px;

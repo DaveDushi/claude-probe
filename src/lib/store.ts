@@ -17,6 +17,8 @@ export interface SessionSummary {
   fileSize: number;
   preview: string | null;
   cwd: string | null;
+  parentSessionId?: string | null;
+  artifactCount?: number;
   // Merged from active sessions at runtime
   status?: string;
   pendingApproval?: unknown;
@@ -88,6 +90,8 @@ export class SessionStore {
         let ended = false;
         let preview: string | null = null;
         let cwd: string | null = null;
+        let parentSessionId: string | null = null;
+        let artifactCount = 0;
 
         // Scan events for metadata
         for (const line of lines) {
@@ -98,6 +102,7 @@ export class SessionStore {
             if (evt.kind === 'session_start') {
               if (evt.cwd) cwd = evt.cwd as string;
               if (evt.model) model = evt.model as string;
+              if (evt.parentSessionId) parentSessionId = evt.parentSessionId as string;
             }
             if (evt.kind === 'init') {
               model = evt.model as string;
@@ -105,6 +110,13 @@ export class SessionStore {
             }
             if (evt.kind === 'tool_call' || (evt.kind === 'block_start' && (evt.blockType === 'tool_use' || evt.blockType === 'server_tool_use'))) {
               toolCalls++;
+              // Count file-producing tools for artifact count
+              const tn = ((evt.toolName as string) || '').toLowerCase();
+              if (tn === 'write' || tn.endsWith('::write') ||
+                  tn === 'edit' || tn.endsWith('::edit') ||
+                  tn === 'read' || tn.endsWith('::read')) {
+                artifactCount++;
+              }
             }
             if (!preview && evt.kind === 'user_message' && evt.text) {
               preview = (evt.text as string).slice(0, 150).trim();
@@ -147,6 +159,8 @@ export class SessionStore {
           fileSize: stat.size,
           preview,
           cwd,
+          parentSessionId,
+          artifactCount,
         });
       } catch {
         // skip unreadable files

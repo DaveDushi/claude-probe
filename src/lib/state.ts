@@ -21,6 +21,57 @@ export interface ActiveBlock {
   parsedInput?: unknown;
 }
 
+/* ── Artifact tracking ── */
+
+export type ArtifactOperation = 'created' | 'modified' | 'read';
+
+export interface Artifact {
+  filePath: string;
+  operation: ArtifactOperation;
+  toolName: string;
+  toolId: string;
+  ts: number;
+}
+
+const PATH_KEYS = ['file_path', 'path', 'filePath', 'directory'] as const;
+
+/** Map tool name → artifact operation (null = not a file tool). */
+function toolToOp(name: string): ArtifactOperation | null {
+  const n = name.toLowerCase();
+  if (n === 'write' || n.endsWith('::write')) return 'created';
+  if (n === 'edit' || n.endsWith('::edit'))   return 'modified';
+  if (n === 'read' || n.endsWith('::read'))   return 'read';
+  return null;
+}
+
+/** Extract artifacts from a tool_call-shaped object. */
+export function extractArtifacts(
+  toolName: string | null,
+  toolId: string | null,
+  input: unknown,
+  ts: number,
+): Artifact[] {
+  if (!toolName) return [];
+  const op = toolToOp(toolName);
+  if (!op) return [];
+  if (!input || typeof input !== 'object') return [];
+
+  const obj = input as Record<string, unknown>;
+  const artifacts: Artifact[] = [];
+  for (const key of PATH_KEYS) {
+    if (typeof obj[key] === 'string' && obj[key]) {
+      artifacts.push({
+        filePath: obj[key] as string,
+        operation: op,
+        toolName,
+        toolId: toolId || '',
+        ts,
+      });
+    }
+  }
+  return artifacts;
+}
+
 export interface SessionSnapshot {
   events: ProbeEvent[];
   usage: UsageStats;
@@ -28,6 +79,7 @@ export interface SessionSnapshot {
   sessionId: string | null;
   startTime: number;
   activeBlocks: Record<number, ActiveBlock>;
+  artifacts: Artifact[];
 }
 
 export class SessionState {
@@ -45,6 +97,7 @@ export class SessionState {
   turns: number = 0;
   activeBlocks: Record<number, ActiveBlock> = {};
   toolResults: Record<string, { content: string; isError: boolean }> = {};
+  artifacts: Artifact[] = [];
 
   addEvent(event: ProbeEvent): ProbeEvent {
     this.events.push(event);
@@ -116,6 +169,11 @@ export class SessionState {
           } catch {
             block.parsedInput = block.content;
           }
+          // Streaming mode: extract artifacts from completed tool block
+          const arts = extractArtifacts(
+            block.toolName, block.toolId, block.parsedInput, event.ts,
+          );
+          this.artifacts.push(...arts);
         }
         delete this.activeBlocks[event.blockIndex as number];
         break;
@@ -128,9 +186,17 @@ export class SessionState {
         };
         break;
 
-      case 'tool_call':
-        // Complete mode tool call — store for matching with result
+      case 'tool_call': {
+        // Complete mode tool call — extract artifacts
+        const arts = extractArtifacts(
+          event.toolName as string,
+          event.toolId as string,
+          event.input,
+          event.ts,
+        );
+        this.artifacts.push(...arts);
         break;
+      }
     }
 
     return event;
@@ -144,6 +210,7 @@ export class SessionState {
       sessionId: this.sessionId,
       startTime: this.startTime,
       activeBlocks: { ...this.activeBlocks },
+      artifacts: [...this.artifacts],
     };
   }
 }

@@ -10,6 +10,8 @@
   const activeBlocks = {};
   // Map tool IDs to their card elements for pairing call+result
   const toolCardMap = {};
+  // Artifact tracking: filePath -> { operation, toolName, ts }
+  const artifactMap = {};
 
   // --- DOM refs ---
   const timeline = document.getElementById('timeline');
@@ -28,6 +30,9 @@
   const statTurns = document.getElementById('stat-turns');
   const toolsList = document.getElementById('tools-list');
   const cwdBadge = document.getElementById('cwd-badge');
+  const artifactsList = document.getElementById('artifacts-list');
+  const parentLink = document.getElementById('parent-link');
+  const childrenBadge = document.getElementById('children-badge');
 
   // Filters
   const filters = {
@@ -94,6 +99,43 @@
       .sort((a, b) => b[1] - a[1])
       .map(([name, count]) => `<span class="tool-tag">${escapeHtml(name)}<span class="tool-count">×${count}</span></span>`)
       .join('');
+  }
+
+  function trackArtifact(toolName, input, ts) {
+    if (!toolName || !input) return;
+    const name = toolName.toLowerCase();
+    let op = null;
+    if (name === 'write' || name.endsWith('::write')) op = 'created';
+    else if (name === 'edit' || name.endsWith('::edit')) op = 'modified';
+    else if (name === 'read' || name.endsWith('::read')) op = 'read';
+    if (!op) return;
+    const obj = typeof input === 'object' ? input : {};
+    for (const key of ['file_path', 'path', 'filePath', 'directory']) {
+      if (typeof obj[key] === 'string' && obj[key]) {
+        const existing = artifactMap[obj[key]];
+        const priority = { read: 0, modified: 1, created: 2 };
+        if (!existing || priority[op] > priority[existing.operation]) {
+          artifactMap[obj[key]] = { operation: op, toolName, ts };
+        }
+        updateArtifactsList();
+      }
+    }
+  }
+
+  function updateArtifactsList() {
+    const entries = Object.entries(artifactMap);
+    if (entries.length === 0) {
+      artifactsList.innerHTML = '<span class="dim">None yet</span>';
+      return;
+    }
+    entries.sort((a, b) => b[1].ts - a[1].ts);
+    artifactsList.innerHTML = entries.map(([filePath, info]) => {
+      const icon = info.operation === 'created' ? '+' : info.operation === 'modified' ? '~' : 'R';
+      const opClass = 'artifact-' + info.operation;
+      const parts = filePath.replace(/\\/g, '/').split('/');
+      const shortPath = parts.length > 2 ? parts.slice(-2).join('/') : filePath;
+      return `<div class="artifact-row" title="${escapeHtml(filePath)}"><span class="artifact-op ${opClass}">${icon}</span><span class="artifact-path">${escapeHtml(shortPath)}</span></div>`;
+    }).join('');
   }
 
   // --- Scroll management ---
@@ -382,11 +424,14 @@
         }
 
         if (block.type === 'tool_use' && block.content) {
+          let parsed = null;
           try {
-            block.element.textContent = JSON.stringify(JSON.parse(block.content), null, 2);
+            parsed = JSON.parse(block.content);
+            block.element.textContent = JSON.stringify(parsed, null, 2);
           } catch {
             block.element.textContent = block.content;
           }
+          if (parsed && block.toolName) trackArtifact(block.toolName, parsed, event.ts);
           const lines = block.element.textContent.split('\n').length;
           if (lines > 15) {
             block.element.classList.add('collapsed');
@@ -442,6 +487,7 @@
       const toolName = event.toolName || 'Unknown';
       toolCounts[toolName] = (toolCounts[toolName] || 0) + 1;
       updateToolsList();
+      trackArtifact(toolName, event.input, event.ts);
 
       const { row, block, body } = createAccordion(event.ts, 'tool', {
         icon: '\u26A1', label: toolName, className: 'tool-accordion',
@@ -634,6 +680,22 @@
         if (data.cwd && cwdBadge) {
           cwdBadge.textContent = data.cwd;
           cwdBadge.title = data.cwd;
+        }
+
+        // Parent/child navigation
+        if (data.parentSessionId && parentLink) {
+          parentLink.style.display = '';
+          const a = document.createElement('a');
+          a.href = `/index.html?session=${encodeURIComponent(data.parentSessionId)}`;
+          a.textContent = 'Parent';
+          a.className = 'nav-link';
+          a.style.fontSize = '12px';
+          parentLink.appendChild(a);
+        }
+        if (data.childSessionIds && data.childSessionIds.length > 0 && childrenBadge) {
+          childrenBadge.style.display = '';
+          childrenBadge.textContent = `${data.childSessionIds.length} child${data.childSessionIds.length > 1 ? 'ren' : ''}`;
+          childrenBadge.title = data.childSessionIds.join(', ');
         }
 
         for (const evt of data.events) {
