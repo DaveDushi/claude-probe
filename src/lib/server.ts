@@ -47,6 +47,8 @@ export interface Session {
   parentSessionId: string | null;
   spawnReason: string | null;
   childSessionIds: string[];
+  isReplay: boolean;
+  replaySourceId: string | null;
 }
 
 interface CreateSessionOpts {
@@ -64,6 +66,8 @@ interface CreateSessionOpts {
 interface IngestContext {
   sessionId: string | null;
   state: SessionState;
+  /** True if a managed session already handles this Claude session — skip all writes. */
+  isDuplicateOfManaged?: boolean;
 }
 
 export interface ServerOptions {
@@ -191,6 +195,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
   const ingestSessions = new Map<string, IngestContext>();
   let activeConnectionId: string | null = null;
   const pendingPrompts = new Map<string, { prompt: string }>();
+  /** First-claim-wins: maps Claude session ID → probe session ID to prevent duplicate files. */
+  const claimedClaudeIds = new Map<string, string>();
 
   // ================================================================
   // Session management
@@ -240,6 +246,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       parentSessionId: opts.parentSessionId || null,
       spawnReason: opts.spawnReason || null,
       childSessionIds: [],
+      isReplay: false,
+      replaySourceId: null,
     };
 
     // Register as child on parent
@@ -513,10 +521,25 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       : getOrCreateIngest(connectionId);
 
     for (const event of events) {
+      // Skip all events if this ingest is a duplicate of another connection
+      if (ctx.isDuplicateOfManaged) continue;
+
       if (event.kind === 'init' && event.sessionId) {
-        if (!session) {
-          if (store.hasSession(event.sessionId as string)) {
-            ctx.sessionId = event.sessionId as string;
+        const claudeId = event.sessionId as string;
+
+        // First-claim-wins: whoever processes init first owns this Claude session ID.
+        // Any later connection with the same Claude ID is a duplicate.
+        if (claimedClaudeIds.has(claudeId)) {
+          ctx.isDuplicateOfManaged = true;
+          continue;
+        }
+
+        if (session) {
+          session.claudeSessionId = claudeId;
+          claimedClaudeIds.set(claudeId, session.sessionId);
+        } else {
+          if (store.hasSession(claudeId)) {
+            ctx.sessionId = claudeId;
             const existing = store.loadSession(ctx.sessionId);
             if (existing) {
               for (const e of existing) ctx.state.addEvent(e);
@@ -531,11 +554,9 @@ export function createServer(port: number, publicDir: string, store: SessionStor
             store.appendEvent(ctx.sessionId, resumeEvent);
             broadcastToDashboard(resumeEvent, ctx.sessionId);
           } else {
-            ctx.sessionId = event.sessionId as string;
+            ctx.sessionId = claudeId;
           }
-        }
-        if (session) {
-          session.claudeSessionId = event.sessionId as string;
+          claimedClaudeIds.set(claudeId, ctx.sessionId || claudeId);
         }
       }
 
@@ -554,17 +575,20 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     const ctx = ingestSessions.get(connectionId);
     if (!ctx) return null;
 
-    const endEvent: ProbeEvent = {
-      id: `evt_${Date.now()}_end`,
-      ts: Date.now(),
-      kind: 'session_complete',
-      durationMs: Date.now() - ctx.state.startTime,
-    };
-    ctx.state.addEvent(endEvent);
-    if (ctx.sessionId) {
-      store.appendEvent(ctx.sessionId, endEvent);
+    // Don't write terminal event for duplicate ingests — managed session handles it
+    if (!ctx.isDuplicateOfManaged) {
+      const endEvent: ProbeEvent = {
+        id: `evt_${Date.now()}_end`,
+        ts: Date.now(),
+        kind: 'session_complete',
+        durationMs: Date.now() - ctx.state.startTime,
+      };
+      ctx.state.addEvent(endEvent);
+      if (ctx.sessionId) {
+        store.appendEvent(ctx.sessionId, endEvent);
+      }
+      broadcastToDashboard(endEvent, ctx.sessionId);
     }
-    broadcastToDashboard(endEvent, ctx.sessionId);
 
     const sessionId = ctx.sessionId;
     ingestSessions.delete(connectionId);
@@ -767,6 +791,14 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           });
         }
       }
+      // Mark orphaned sessions as recoverable
+      const activeIds = new Set(activeSessions.keys());
+      for (const s of stored) {
+        if (!s.ended && s.eventCount > 0 && !activeIds.has(s.id)) {
+          s.recoverable = true;
+        }
+      }
+
       json(res, 200, stored);
       return;
     }
@@ -911,6 +943,174 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           }
         }
         json(res, 200, { sessionId: id, artifacts });
+        return;
+      }
+
+      if (action === 'recover' && req.method === 'POST') {
+        // Recover an orphaned session by resuming its Claude conversation
+        const active = activeSessions.get(id);
+        if (active && active.status !== 'done' && active.status !== 'error') {
+          json(res, 409, { error: 'Session is still active' }); return;
+        }
+        if (!store.hasSession(id)) { json(res, 404, { error: 'Session not found' }); return; }
+        const events = store.loadSession(id);
+        if (!events || events.length === 0) { json(res, 400, { error: 'Session has no events' }); return; }
+
+        // Check if already ended
+        const hasTerminal = events.some(e =>
+          e.kind === 'session_end' || e.kind === 'session_complete'
+        );
+        if (hasTerminal) { json(res, 400, { error: 'Session already ended' }); return; }
+
+        // Extract Claude session ID for resume
+        const claudeId = store.getClaudeSessionId(id);
+        if (!claudeId) { json(res, 400, { error: 'No Claude session ID found (crashed before init)' }); return; }
+
+        // Extract original model and cwd from events
+        let origModel: string | undefined;
+        let origCwd: string | undefined;
+        for (const evt of events) {
+          if (evt.kind === 'session_start') {
+            if (evt.cwd) origCwd = evt.cwd as string;
+            if (evt.model) origModel = evt.model as string;
+          }
+          if (evt.kind === 'init' && evt.model) origModel = evt.model as string;
+        }
+
+        // Mark old session as recovered (append terminal event)
+        const recoveredEvent: ProbeEvent = {
+          id: `evt_${Date.now()}_recovered`,
+          ts: Date.now(),
+          kind: 'session_complete',
+          reason: 'recovered',
+          durationMs: Date.now() - (events[0]?.ts || Date.now()),
+        };
+        store.appendEvent(id, recoveredEvent);
+
+        // Parse body for optional overrides
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(await readBody(req)); } catch { /* use defaults */ }
+
+        // Create new session that resumes the Claude conversation
+        const newSessionId = createSession({
+          prompt: (body.prompt as string) || 'Continue from where you left off.',
+          model: (body.model as string) || origModel,
+          resumeSessionId: claudeId,
+          cwd: origCwd,
+          parentSessionId: id, // link recovery chain
+          spawnReason: 'recovered',
+        });
+
+        json(res, 200, { newSessionId, claudeSessionId: claudeId, recoveredFrom: id });
+        return;
+      }
+
+      if (action === 'replay' && req.method === 'POST') {
+        // Create a replay session that feeds stored events through the dashboard
+        if (!store.hasSession(id)) { json(res, 404, { error: 'Session not found' }); return; }
+        const rawEvents = store.loadSession(id);
+        if (!rawEvents || rawEvents.length === 0) { json(res, 400, { error: 'Session has no events' }); return; }
+        const replayEvents = rawEvents; // non-null after guard
+
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(await readBody(req)); } catch { /* use defaults */ }
+        let speed = parseFloat(body.speed as string) || 10;
+        if (speed < 0.1) speed = 0.1;
+
+        const replayId = store.generateSessionId();
+
+        // Create a session object without a child process
+        const replaySession: Session = {
+          sessionId: replayId,
+          claudeSessionId: null,
+          process: null,
+          ws: null,
+          state: new SessionState(),
+          status: 'running',
+          pendingApproval: null,
+          autoApprove: true,
+          promptQueue: [],
+          gotResult: false,
+          error: null,
+          errorCode: null,
+          lastActivityAt: Date.now(),
+          prompt: null,
+          model: undefined,
+          cwd: process.cwd(),
+          limits: { ...DEFAULT_SESSION_LIMITS },
+          parentSessionId: null,
+          spawnReason: 'replay',
+          childSessionIds: [],
+          isReplay: true,
+          replaySourceId: id,
+        };
+
+        activeSessions.set(replayId, replaySession);
+
+        // Emit replay start event
+        const startEvent: ProbeEvent = {
+          id: `evt_${Date.now()}_replay_start`,
+          ts: Date.now(),
+          kind: 'session_start',
+          cwd: replaySession.cwd,
+          prompt: `[Replay of ${id}]`,
+          model: null,
+          isReplay: true,
+          replaySourceId: id,
+        };
+        replaySession.state.addEvent(startEvent);
+        store.appendEvent(replayId, startEvent);
+        broadcastToDashboard(startEvent, replayId);
+        broadcastSessionStatus(replaySession);
+
+        // Start async replay loop
+        let idx = 0;
+        function scheduleNext() {
+          if (idx >= replayEvents.length || replaySession.status === 'done' || replaySession.status === 'error') {
+            // End replay
+            replaySession.status = 'done';
+            const endEvent: ProbeEvent = {
+              id: `evt_${Date.now()}_replay_end`,
+              ts: Date.now(),
+              kind: 'session_complete',
+              reason: 'replay_finished',
+              durationMs: Date.now() - replaySession.state.startTime,
+            };
+            replaySession.state.addEvent(endEvent);
+            store.appendEvent(replayId, endEvent);
+            broadcastToDashboard(endEvent, replayId);
+            broadcastSessionStatus(replaySession);
+            return;
+          }
+
+          const evt = replayEvents[idx];
+          const nextEvt = replayEvents[idx + 1];
+          idx++;
+
+          // Re-ID and re-timestamp the event
+          const replayedEvent: ProbeEvent = {
+            ...evt,
+            id: `evt_${Date.now()}_r${idx}`,
+            ts: Date.now(),
+          };
+          replaySession.state.addEvent(replayedEvent);
+          store.appendEvent(replayId, replayedEvent);
+          broadcastToDashboard(replayedEvent, replayId);
+          replaySession.lastActivityAt = Date.now();
+
+          // Calculate delay to next event
+          let delayMs = 50; // minimum delay
+          if (nextEvt && evt.ts && nextEvt.ts) {
+            delayMs = Math.max(50, (nextEvt.ts - evt.ts) / speed);
+            if (delayMs > 2000) delayMs = 2000; // cap at 2s
+          }
+
+          setTimeout(scheduleNext, delayMs);
+        }
+
+        scheduleNext();
+
+        json(res, 200, { replaySessionId: replayId, eventCount: replayEvents.length, speed });
         return;
       }
 

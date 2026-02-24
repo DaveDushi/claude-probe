@@ -129,7 +129,9 @@
 
     // Status indicator
     let statusHtml = '';
-    if (!s.ended) {
+    if (s.recoverable) {
+      statusHtml = '<span class="session-recoverable-badge">RECOVERABLE</span>';
+    } else if (!s.ended) {
       statusHtml = '<span class="session-live-badge">LIVE</span>';
     } else if (s.isError) {
       statusHtml = '<svg class="session-error-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
