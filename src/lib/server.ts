@@ -11,6 +11,7 @@ import {
   SessionLimits, GlobalLimits, DEFAULT_GLOBAL_LIMITS, DEFAULT_SESSION_LIMITS,
   checkSessionLimits, checkConcurrency, CircuitBreaker,
 } from './limits';
+import { PolicyEngine } from './policies';
 
 // ================================================================
 // Types
@@ -103,6 +104,9 @@ export function createServer(port: number, publicDir: string, store: SessionStor
 
   // --- Circuit breaker for spawn failures ---
   const circuitBreaker = new CircuitBreaker();
+
+  // --- Approval policy engine ---
+  const policyEngine = new PolicyEngine();
 
   // --- Session watchdog (timeout detection) ---
   const watchdog = new SessionWatchdog();
@@ -321,6 +325,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     session.status = 'done';
     broadcastSessionStatus(session);
     watchdog.untrack(sessionId);
+    policyEngine.clearSessionPolicies(sessionId);
     activeSessions.delete(sessionId);
     return true;
   }
@@ -887,6 +892,38 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       }
     }
 
+    // --- Policy management ---
+    if (urlPath === '/api/policies' && req.method === 'GET') {
+      const sessionId = new URL(req.url!, `http://localhost:${port}`).searchParams.get('session') || undefined;
+      json(res, 200, policyEngine.listActive(sessionId));
+      return;
+    }
+
+    if (urlPath === '/api/policies' && req.method === 'POST') {
+      try {
+        const body = JSON.parse(await readBody(req));
+        if (!body.toolPattern) { json(res, 400, { error: 'toolPattern required' }); return; }
+        const policy = policyEngine.addPolicy({
+          toolPattern: body.toolPattern,
+          pathPattern: body.pathPattern,
+          scope: body.scope || 'global',
+          sessionId: body.sessionId,
+          expiresAt: body.expiresInMs ? Date.now() + body.expiresInMs : undefined,
+        });
+        json(res, 200, policy);
+      } catch (err: unknown) {
+        json(res, 400, { error: (err as Error).message });
+      }
+      return;
+    }
+
+    if (urlPath?.startsWith('/api/policies/') && req.method === 'DELETE') {
+      const policyId = urlPath.slice('/api/policies/'.length);
+      const removed = policyEngine.removePolicy(decodeURIComponent(policyId));
+      json(res, removed ? 200 : 404, { removed });
+      return;
+    }
+
     // --- Legacy: queue-prompt ---
     if (urlPath === '/api/queue-prompt' && req.method === 'POST') {
       try {
@@ -1020,44 +1057,105 @@ export function createServer(port: number, publicDir: string, store: SessionStor
         // --- Handle control_request (permission) ---
         if (obj.type === 'control_request') {
           const request = obj.request as Record<string, unknown> | undefined;
-          if (request && request.subtype === 'can_use_tool') {
-            if (session && !session.autoApprove) {
-              session.pendingApproval = {
-                requestId: obj.request_id as string,
-                toolName: request.tool_name as string,
-                input: request.tool_input,
-                requestedAt: Date.now(),
-              };
-              session.status = 'waiting_approval';
-              watchdog.trackApprovalWaiting(session.sessionId);
-              broadcastSessionStatus(session);
 
-              const approvalEvent: ProbeEvent = {
-                id: `evt_${Date.now()}_approval`,
-                ts: Date.now(),
-                kind: 'approval_request',
-                toolName: request.tool_name as string,
-                input: request.tool_input,
-                requestId: obj.request_id as string,
-              };
-              if (session) {
+          // Safe fallback: malformed control_request → deny with structured error
+          if (!request || !request.subtype || !obj.request_id) {
+            const errorResponse = JSON.stringify({
+              type: 'control_response',
+              request_id: obj.request_id || 'unknown',
+              response: {
+                behavior: 'deny',
+                message: 'Malformed control_request: missing request or request_id',
+              },
+            }) + '\n';
+            ws.send(errorResponse);
+            continue;
+          }
+
+          if (request.subtype === 'can_use_tool') {
+            const toolName = (request.tool_name as string) || 'unknown';
+            // Normalize tool input: ensure it's at least an empty object
+            const toolInput = request.tool_input ?? {};
+            const requestId = obj.request_id as string;
+
+            if (session && !session.autoApprove) {
+              // Check approval policies first
+              const policyMatch = policyEngine.match(toolName, toolInput, session.sessionId);
+
+              if (policyMatch.matched) {
+                // Policy auto-approves this tool use
+                const response = JSON.stringify({
+                  type: 'control_response',
+                  request_id: requestId,
+                  response: {
+                    behavior: 'allow',
+                    updatedInput: toolInput,
+                  },
+                }) + '\n';
+                ws.send(response);
+
+                const policyEvent: ProbeEvent = {
+                  id: `evt_${Date.now()}_policy_approve`,
+                  ts: Date.now(),
+                  kind: 'approval_granted',
+                  toolName,
+                  requestId,
+                  autoPolicy: true,
+                  policyId: policyMatch.policy!.id,
+                };
+                session.state.addEvent(policyEvent);
+                store.appendEvent(session.sessionId, policyEvent);
+                broadcastToDashboard(policyEvent, session.sessionId);
+              } else {
+                // Queue for manual approval
+                session.pendingApproval = {
+                  requestId,
+                  toolName,
+                  input: toolInput,
+                  requestedAt: Date.now(),
+                };
+                session.status = 'waiting_approval';
+                watchdog.trackApprovalWaiting(session.sessionId);
+                broadcastSessionStatus(session);
+
+                const approvalEvent: ProbeEvent = {
+                  id: `evt_${Date.now()}_approval`,
+                  ts: Date.now(),
+                  kind: 'approval_request',
+                  toolName,
+                  input: toolInput,
+                  requestId,
+                };
                 session.state.addEvent(approvalEvent);
                 store.appendEvent(session.sessionId, approvalEvent);
                 broadcastToDashboard(approvalEvent, session.sessionId);
               }
             } else {
+              // Auto-approve (session-level flag)
               const response = JSON.stringify({
                 type: 'control_response',
-                request_id: obj.request_id,
+                request_id: requestId,
                 response: {
                   behavior: 'allow',
-                  updatedInput: request.tool_input,
+                  updatedInput: toolInput,
                 },
               }) + '\n';
               ws.send(response);
             }
             continue;
           }
+
+          // Unknown control_request subtype → deny safely
+          const fallbackResponse = JSON.stringify({
+            type: 'control_response',
+            request_id: obj.request_id,
+            response: {
+              behavior: 'deny',
+              message: `Unknown control_request subtype: ${request.subtype}`,
+            },
+          }) + '\n';
+          ws.send(fallbackResponse);
+          continue;
         }
 
         // --- Ignore keep_alive ---

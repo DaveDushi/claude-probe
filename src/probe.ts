@@ -502,6 +502,82 @@ async function cmdDoctor(): Promise<void> {
   }
 }
 
+// ================================================================
+// Policy commands
+// ================================================================
+
+async function cmdPolicyAdd(): Promise<void> {
+  const toolPattern = getFlag('--tool') || args[1];
+  if (!toolPattern) {
+    process.stderr.write('probe policy add: --tool <pattern> required (e.g. "Write", "Bash", "*")\n');
+    process.exit(1);
+  }
+
+  const body: Record<string, unknown> = { toolPattern };
+  const pathPattern = getFlag('--path');
+  if (pathPattern) body.pathPattern = pathPattern;
+  const sessionId = getFlag('--session');
+  if (sessionId) {
+    body.scope = 'session';
+    body.sessionId = sessionId;
+  } else {
+    body.scope = 'global';
+  }
+  const expiresMin = getFlag('--expires');
+  if (expiresMin) body.expiresInMs = parseInt(expiresMin, 10) * 60_000;
+
+  const res = await httpPost('/api/policies', body);
+  if (res.status !== 200) {
+    process.stderr.write(`probe policy add: ${asRecord(res.data).error || 'failed'}\n`);
+    process.exit(1);
+  }
+  const d = asRecord(res.data);
+  process.stdout.write(`policy ${d.id}: allow ${d.toolPattern}${d.pathPattern ? ` path=${d.pathPattern}` : ''} scope=${d.scope}\n`);
+}
+
+async function cmdPolicyList(): Promise<void> {
+  const sessionId = getFlag('--session') || '';
+  const url = sessionId ? `/api/policies?session=${sessionId}` : '/api/policies';
+  const res = await httpGet(url);
+  if (res.status !== 200) {
+    process.stderr.write('probe policy list: failed\n');
+    process.exit(1);
+  }
+
+  const policies = (res.data || []) as Record<string, unknown>[];
+  if (policies.length === 0) {
+    process.stdout.write('no active policies\n');
+    return;
+  }
+
+  for (const p of policies) {
+    let line = `${p.id}: allow ${p.toolPattern}`;
+    if (p.pathPattern) line += ` path=${p.pathPattern}`;
+    line += ` scope=${p.scope}`;
+    if (p.sessionId) line += ` session=${p.sessionId}`;
+    if (p.expiresAt) {
+      const remaining = Math.max(0, (p.expiresAt as number) - Date.now());
+      line += ` expires=${Math.round(remaining / 60_000)}m`;
+    }
+    process.stdout.write(line + '\n');
+  }
+}
+
+async function cmdPolicyRemove(): Promise<void> {
+  const policyId = args[1];
+  if (!policyId) {
+    process.stderr.write('probe policy remove: policy ID required\n');
+    process.exit(1);
+  }
+
+  const res = await httpDelete(`/api/policies/${policyId}`);
+  if (res.status !== 200) {
+    process.stderr.write(`probe policy remove: not found\n`);
+    process.exit(1);
+  }
+  process.stdout.write('removed\n');
+}
+
 function printUsage(): void {
   process.stderr.write(`
 claude-probe - control Claude Code sessions
@@ -519,6 +595,9 @@ Commands:
   result <id>                   Get final result text
   sessions                      List all sessions
   doctor                        Server/session health diagnostics
+  policy add --tool <pattern>   Add approval policy (e.g. "Write", "*")
+  policy list                   List active policies
+  policy remove <id>            Remove a policy
 
 Options for 'new':
   --model <model>               Claude model to use
@@ -534,14 +613,18 @@ Options for 'serve':
   --max-duration <minutes>      Global default duration limit
   --max-sessions <n>            Max concurrent active sessions
 
+Options for 'policy add':
+  --tool <pattern>              Tool name glob ("Write", "Bash", "*")
+  --path <pattern>              Optional file path glob ("/workspace/**")
+  --session <id>                Scope to specific session (default: global)
+  --expires <minutes>           Auto-expire after N minutes
+
 Global:
   --port <port>                 Server port (default: 3456)
 
 `);
 }
 
-// Suppress unused warnings for functions that are part of the public API
-void httpDelete;
 
 // ================================================================
 // Dispatch
@@ -592,6 +675,18 @@ switch (command) {
   case 'diag':
     cmdDoctor();
     break;
+  case 'policy': {
+    const subCmd = args[1];
+    args.splice(0, 1); // shift so subcommand functions see correct args
+    if (subCmd === 'add') cmdPolicyAdd();
+    else if (subCmd === 'list' || subCmd === 'ls') cmdPolicyList();
+    else if (subCmd === 'remove' || subCmd === 'rm') cmdPolicyRemove();
+    else {
+      process.stderr.write('probe policy: subcommand required (add|list|remove)\n');
+      process.exit(1);
+    }
+    break;
+  }
   case 'help':
   case '--help':
   case '-h':
