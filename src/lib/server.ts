@@ -49,6 +49,7 @@ export interface Session {
   childSessionIds: string[];
   isReplay: boolean;
   replaySourceId: string | null;
+  permissionMode: string;
 }
 
 interface CreateSessionOpts {
@@ -73,6 +74,7 @@ interface IngestContext {
 export interface ServerOptions {
   claudePath?: string;
   limits?: Partial<GlobalLimits>;
+  startupTimeoutMs?: number;
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -118,7 +120,9 @@ export function createServer(port: number, publicDir: string, store: SessionStor
   const policyEngine = new PolicyEngine();
 
   // --- Session watchdog (timeout detection) ---
-  const watchdog = new SessionWatchdog();
+  const watchdogOpts: Partial<import('./watchdog').WatchdogConfig> = {};
+  if (opts?.startupTimeoutMs) watchdogOpts.startupTimeoutMs = opts.startupTimeoutMs;
+  const watchdog = new SessionWatchdog(watchdogOpts);
 
   watchdog.onTimeout = (sessionId: string, reason: string, message: string) => {
     const session = activeSessions.get(sessionId);
@@ -248,6 +252,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       childSessionIds: [],
       isReplay: false,
       replaySourceId: null,
+      permissionMode: 'plan', // default, overridden below
     };
 
     // Register as child on parent
@@ -289,8 +294,23 @@ export function createServer(port: number, publicDir: string, store: SessionStor
 
     const hasPermFlag = passthroughFlags &&
       (passthroughFlags.includes('--permission-mode') || passthroughFlags.includes('--dangerously-skip-permissions'));
-    if (autoApprove && !hasPermFlag) {
-      claudeArgs.push('--permission-mode', 'bypassPermissions');
+    if (!hasPermFlag) {
+      if (autoApprove) {
+        claudeArgs.push('--permission-mode', 'bypassPermissions');
+        session.permissionMode = 'bypassPermissions';
+      } else {
+        // Explicit plan mode ensures tool approvals route through the SDK
+        // WebSocket as control_request messages (default mode uses terminal prompts)
+        claudeArgs.push('--permission-mode', 'plan');
+        session.permissionMode = 'plan';
+      }
+    } else if (passthroughFlags) {
+      const pmIdx = passthroughFlags.indexOf('--permission-mode');
+      if (pmIdx !== -1 && passthroughFlags[pmIdx + 1]) {
+        session.permissionMode = passthroughFlags[pmIdx + 1];
+      } else if (passthroughFlags.includes('--dangerously-skip-permissions')) {
+        session.permissionMode = 'bypassPermissions';
+      }
     }
 
     if (passthroughFlags) claudeArgs.push(...passthroughFlags);
@@ -656,6 +676,9 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       pendingApproval: session.pendingApproval,
       parentSessionId: session.parentSessionId,
       childSessionIds: session.childSessionIds,
+      permissionMode: session.permissionMode,
+      error: session.error,
+      errorCode: session.errorCode,
     });
     for (const ws of dashboardClients) {
       if (ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -889,6 +912,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           childSessionIds: session.childSessionIds,
           spawnReason: session.spawnReason,
           artifactCount: session.state.artifacts.length,
+          permissionMode: session.permissionMode,
+          autoApprove: session.autoApprove,
         };
         if (session.pendingApproval) {
           result.pendingApproval = session.pendingApproval;
@@ -1062,6 +1087,7 @@ export function createServer(port: number, publicDir: string, store: SessionStor
           childSessionIds: [],
           isReplay: true,
           replaySourceId: id,
+          permissionMode: 'bypassPermissions',
         };
 
         activeSessions.set(replayId, replaySession);

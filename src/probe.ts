@@ -160,10 +160,13 @@ async function cmdServe(): Promise<void> {
   const maxSessions = getFlag('--max-sessions');
   if (maxSessions) limits.maxConcurrentSessions = parseInt(maxSessions, 10);
 
+  const startupTimeout = getFlag('--startup-timeout');
+
   const store = new SessionStore(dataDir);
   const server = createServer(port, publicDir, store, {
     claudePath: claudePath || undefined,
     limits: Object.keys(limits).length > 0 ? limits : undefined,
+    startupTimeoutMs: startupTimeout ? parseInt(startupTimeout, 10) * 1000 : undefined,
   });
 
   await server.start();
@@ -255,6 +258,11 @@ async function cmdStatus(): Promise<void> {
   }
   if (s.spawnReason) process.stdout.write(`reason: ${s.spawnReason}\n`);
   if (s.artifactCount) process.stdout.write(`artifacts: ${s.artifactCount} files\n`);
+  if (s.permissionMode) {
+    let modeInfo = `permissions: ${s.permissionMode}`;
+    if (s.permissionMode === 'bypassPermissions') modeInfo += ' (approvals disabled)';
+    process.stdout.write(modeInfo + '\n');
+  }
 
   if (s.stuckForMs && (s.stuckForMs as number) > 30000) {
     process.stdout.write(`warning: no activity for ${formatDuration(s.stuckForMs as number)}\n`);
@@ -772,6 +780,7 @@ Options for 'sessions':
   --tree                        Show parent/child tree view
 
 Options for 'serve':
+  --startup-timeout <seconds>   Max wait for CLI WebSocket connect (default: 90)
   --max-cost <usd>              Global default cost cap per session
   --max-turns <n>               Global default turn limit
   --max-duration <minutes>      Global default duration limit
