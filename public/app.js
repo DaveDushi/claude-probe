@@ -31,6 +31,7 @@
 
   // Filters
   const filters = {
+    user: document.getElementById('filter-user'),
     text: document.getElementById('filter-text'),
     tool: document.getElementById('filter-tool'),
     thinking: document.getElementById('filter-thinking'),
@@ -118,6 +119,7 @@
 
   // --- Filter visibility ---
   function getEventCategory(kind) {
+    if (kind === 'user_message') return 'user';
     if (['text', 'text_delta'].includes(kind)) return 'text';
     if (['tool_call', 'tool_input_delta', 'block_start'].includes(kind)) return 'tool';
     if (['thinking', 'thinking_delta'].includes(kind)) return 'thinking';
@@ -126,81 +128,95 @@
   }
 
   function applyFilters() {
-    document.querySelectorAll('.event-card').forEach(card => {
-      const cat = card.dataset.category;
+    document.querySelectorAll('.chat-row').forEach(row => {
+      const cat = row.dataset.category;
       if (cat && filters[cat]) {
-        card.style.display = filters[cat].checked ? '' : 'none';
+        row.style.display = filters[cat].checked ? '' : 'none';
       }
     });
   }
 
   Object.values(filters).forEach(cb => cb.addEventListener('change', applyFilters));
 
-  // --- Render events ---
-  function createCard(kind, timestamp, opts = {}) {
-    const card = document.createElement('div');
-    const categoryMap = {
-      tool_call: 'tool', tool_input_delta: 'tool',
-      text: 'text', text_delta: 'text',
-      thinking: 'thinking', thinking_delta: 'thinking',
-      tool_result: 'result',
-      block_start: opts.blockType === 'thinking' ? 'thinking' : opts.blockType === 'tool_use' || opts.blockType === 'server_tool_use' ? 'tool' : 'text',
-    };
-    const cat = categoryMap[kind] || 'system';
-    card.className = `event-card ${cat}-event`;
-    card.dataset.category = cat;
+  // --- Chat UI render helpers ---
 
-    // Check filter visibility
-    if (filters[cat] && !filters[cat].checked) {
-      card.style.display = 'none';
-    }
+  function createChatBubble(timestamp, isUser) {
+    const cat = isUser ? 'user' : 'text';
+    const row = document.createElement('div');
+    row.className = `chat-row ${isUser ? 'user-row' : 'assistant-row'}`;
+    row.dataset.category = cat;
+    if (filters[cat] && !filters[cat].checked) row.style.display = 'none';
+
+    const bubble = document.createElement('div');
+    bubble.className = `chat-bubble ${isUser ? 'user-bubble' : 'assistant-bubble'}`;
+
+    const content = document.createElement('div');
+    content.className = 'bubble-content';
+    bubble.appendChild(content);
+
+    const meta = document.createElement('span');
+    meta.className = 'bubble-meta';
+    meta.textContent = formatTime(timestamp);
+    bubble.appendChild(meta);
+
+    row.appendChild(bubble);
+    return { row, bubble, content };
+  }
+
+  function createAccordion(timestamp, category, opts = {}) {
+    const row = document.createElement('div');
+    row.className = 'chat-row assistant-row';
+    row.dataset.category = category;
+    if (filters[category] && !filters[category].checked) row.style.display = 'none';
+
+    const block = document.createElement('div');
+    block.className = `chat-accordion ${opts.className || ''}`;
 
     const header = document.createElement('div');
-    header.className = 'event-header';
+    header.className = 'accordion-header';
 
-    const ts = document.createElement('span');
-    ts.className = 'event-timestamp';
-    ts.textContent = formatTime(timestamp);
-    header.appendChild(ts);
-
-    if (opts.badge) {
-      const badge = document.createElement('span');
-      badge.className = `event-badge ${opts.badgeClass || ''}`;
-      badge.textContent = opts.badge;
-      header.appendChild(badge);
-    }
-
-    if (opts.title) {
-      const title = document.createElement('span');
-      title.className = 'event-title';
-      title.textContent = opts.title;
-      header.appendChild(title);
-    }
-
-    if (opts.collapsible) {
+    if (opts.icon) {
       const icon = document.createElement('span');
-      icon.className = 'collapse-icon';
-      icon.textContent = '\u25BC';
+      icon.className = 'accordion-icon';
+      icon.textContent = opts.icon;
       header.appendChild(icon);
-      header.classList.add('collapsible-header');
     }
 
-    card.appendChild(header);
+    const label = document.createElement('span');
+    label.className = 'accordion-label';
+    label.textContent = opts.label || '';
+    header.appendChild(label);
+
+    const chevron = document.createElement('span');
+    chevron.className = 'accordion-chevron';
+    chevron.textContent = '\u203A';
+    header.appendChild(chevron);
 
     const body = document.createElement('div');
-    body.className = 'event-body';
-    card.appendChild(body);
+    body.className = 'accordion-body';
 
-    if (opts.collapsible) {
-      let collapsed = false;
-      header.addEventListener('click', () => {
-        collapsed = !collapsed;
-        body.style.display = collapsed ? 'none' : '';
-        header.querySelector('.collapse-icon').classList.toggle('collapsed', collapsed);
-      });
-    }
+    header.addEventListener('click', () => {
+      block.classList.toggle('expanded');
+    });
 
-    return { card, body, header };
+    block.appendChild(header);
+    block.appendChild(body);
+    row.appendChild(block);
+    return { row, block, body, header, label };
+  }
+
+  function createSystemDivider(timestamp, text) {
+    const row = document.createElement('div');
+    row.className = 'chat-row system-row';
+    row.dataset.category = 'system';
+    if (filters.system && !filters.system.checked) row.style.display = 'none';
+
+    const divider = document.createElement('div');
+    divider.className = 'system-divider';
+    divider.textContent = formatTime(timestamp) + ' \u00b7 ' + text;
+
+    row.appendChild(divider);
+    return { row, divider };
   }
 
   function addCodeBlock(parent, text, opts = {}) {
@@ -241,7 +257,7 @@
       if (event.cacheCreation) usage.cacheCreation += event.cacheCreation;
       if (event.cacheRead) usage.cacheRead += event.cacheRead;
       updateStats();
-      return; // Don't render usage events as cards
+      return;
     }
 
     if (kind === 'session_start') {
@@ -249,7 +265,7 @@
         cwdBadge.textContent = event.cwd;
         cwdBadge.title = event.cwd;
       }
-      return; // Don't render as a card
+      return;
     }
 
     if (kind === 'init') {
@@ -258,19 +274,11 @@
       statusDot.className = 'status-dot streaming';
       statusText.textContent = 'Streaming';
 
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'SYS', badgeClass: 'system',
-        title: 'Session initialized',
-      });
+      const { row, divider } = createSystemDivider(event.ts, 'Session initialized');
       if (event.tools && event.tools.length > 0) {
-        const label = document.createElement('div');
-        label.className = 'section-label';
-        label.textContent = `${event.tools.length} tools available`;
-        body.appendChild(label);
-        const toolsStr = event.tools.map(t => typeof t === 'string' ? t : t.name || JSON.stringify(t)).join(', ');
-        addCodeBlock(body, toolsStr);
+        divider.textContent += ` \u00b7 ${event.tools.length} tools`;
       }
-      timeline.appendChild(card);
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
@@ -279,34 +287,31 @@
       if (event.model) modelBadge.textContent = event.model;
       statusDot.className = 'status-dot streaming';
       statusText.textContent = 'Streaming';
-      return; // Don't render as a card
+      return;
     }
 
     if (kind === 'stream_message_delta' || kind === 'stream_message_stop' || kind === 'signature_delta') {
-      return; // Internal events, skip rendering
+      return;
     }
 
     // --- Block-based streaming events ---
     if (kind === 'block_start') {
       if (event.blockType === 'thinking') {
-        const { card, body } = createCard(kind, event.ts, {
-          badge: 'THINK', badgeClass: 'think',
-          title: 'Thinking...',
-          collapsible: true,
+        const { row, block, body, label } = createAccordion(event.ts, 'thinking', {
+          icon: '\u2726', label: 'Thinking\u2026', className: 'thinking-accordion',
         });
         const content = document.createElement('div');
         content.className = 'thinking-content streaming-cursor';
         body.appendChild(content);
-        activeBlocks[event.blockIndex] = { element: content, card, type: 'thinking', content: '' };
-        timeline.appendChild(card);
+        activeBlocks[event.blockIndex] = { element: content, card: block, type: 'thinking', content: '', label };
+        timeline.appendChild(row);
       } else if (event.blockType === 'tool_use' || event.blockType === 'server_tool_use') {
         const toolName = event.toolName || 'Unknown';
         toolCounts[toolName] = (toolCounts[toolName] || 0) + 1;
         updateToolsList();
 
-        const { card, body } = createCard(kind, event.ts, {
-          badge: 'TOOL', badgeClass: 'tool',
-          title: toolName,
+        const { row, block, body } = createAccordion(event.ts, 'tool', {
+          icon: '\u26A1', label: toolName, className: 'tool-accordion',
         });
         const inputLabel = document.createElement('div');
         inputLabel.className = 'section-label';
@@ -317,20 +322,16 @@
         body.appendChild(inputBlock);
 
         activeBlocks[event.blockIndex] = {
-          element: inputBlock, card, body, type: 'tool_use',
+          element: inputBlock, card: block, body, type: 'tool_use',
           content: '', toolId: event.toolId, toolName,
         };
-        if (event.toolId) toolCardMap[event.toolId] = { card, body };
-        timeline.appendChild(card);
+        if (event.toolId) toolCardMap[event.toolId] = { card: block, body };
+        timeline.appendChild(row);
       } else if (event.blockType === 'text') {
-        const { card, body } = createCard(kind, event.ts, {
-          badge: 'TEXT', badgeClass: 'text',
-        });
-        const content = document.createElement('div');
-        content.className = 'text-content streaming-cursor';
-        body.appendChild(content);
-        activeBlocks[event.blockIndex] = { element: content, card, type: 'text', content: '' };
-        timeline.appendChild(card);
+        const { row, bubble, content } = createChatBubble(event.ts, false);
+        content.classList.add('streaming-cursor');
+        activeBlocks[event.blockIndex] = { element: content, card: bubble, type: 'text', content: '' };
+        timeline.appendChild(row);
       }
       scrollToBottom();
       return;
@@ -360,7 +361,6 @@
       const block = activeBlocks[event.blockIndex];
       if (block) {
         block.content += event.partialJson;
-        // Try to pretty-print
         try {
           block.element.textContent = JSON.stringify(JSON.parse(block.content), null, 2);
         } catch {
@@ -376,14 +376,17 @@
       if (block) {
         block.element.classList.remove('streaming-cursor');
 
+        // Update thinking label to past tense
+        if (block.type === 'thinking' && block.label) {
+          block.label.textContent = 'Thought';
+        }
+
         if (block.type === 'tool_use' && block.content) {
-          // Finalize the tool input JSON
           try {
             block.element.textContent = JSON.stringify(JSON.parse(block.content), null, 2);
           } catch {
             block.element.textContent = block.content;
           }
-          // Collapse if long
           const lines = block.element.textContent.split('\n').length;
           if (lines > 15) {
             block.element.classList.add('collapsed');
@@ -404,31 +407,33 @@
       return;
     }
 
+    // --- User message (from agent/OpenClaw) ---
+    if (kind === 'user_message') {
+      const { row, content } = createChatBubble(event.ts, true);
+      content.textContent = event.text;
+      timeline.appendChild(row);
+      scrollToBottom();
+      return;
+    }
+
     // --- Complete message mode events ---
     if (kind === 'text') {
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'TEXT', badgeClass: 'text',
-      });
-      const content = document.createElement('div');
-      content.className = 'text-content';
+      const { row, content } = createChatBubble(event.ts, false);
       content.textContent = event.text;
-      body.appendChild(content);
-      timeline.appendChild(card);
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
 
     if (kind === 'thinking') {
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'THINK', badgeClass: 'think',
-        title: 'Thinking',
-        collapsible: true,
+      const { row, body } = createAccordion(event.ts, 'thinking', {
+        icon: '\u2726', label: 'Thought', className: 'thinking-accordion',
       });
       const content = document.createElement('div');
       content.className = 'thinking-content';
       content.textContent = event.text;
       body.appendChild(content);
-      timeline.appendChild(card);
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
@@ -438,9 +443,8 @@
       toolCounts[toolName] = (toolCounts[toolName] || 0) + 1;
       updateToolsList();
 
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'TOOL', badgeClass: 'tool',
-        title: toolName,
+      const { row, block, body } = createAccordion(event.ts, 'tool', {
+        icon: '\u26A1', label: toolName, className: 'tool-accordion',
       });
       const inputLabel = document.createElement('div');
       inputLabel.className = 'section-label';
@@ -448,14 +452,13 @@
       body.appendChild(inputLabel);
       addCodeBlock(body, formatJson(event.input));
 
-      if (event.toolId) toolCardMap[event.toolId] = { card, body };
-      timeline.appendChild(card);
+      if (event.toolId) toolCardMap[event.toolId] = { card: block, body };
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
 
     if (kind === 'tool_result') {
-      // Try to attach to the matching tool call card
       const existing = toolCardMap[event.toolId];
       if (existing) {
         const resultLabel = document.createElement('div');
@@ -466,15 +469,14 @@
         scrollToBottom();
         return;
       }
-
-      // Standalone result card
-      const { card, body } = createCard(kind, event.ts, {
-        badge: event.isError ? 'ERROR' : 'RESULT',
-        badgeClass: event.isError ? 'error' : 'result',
-        title: `Tool result${event.toolId ? ` (${event.toolId.slice(0, 12)})` : ''}`,
+      // Standalone result — use accordion
+      const { row, body } = createAccordion(event.ts, 'result', {
+        icon: event.isError ? '\u2717' : '\u2713',
+        label: `Result${event.toolId ? ' (' + event.toolId.slice(0, 8) + ')' : ''}`,
+        className: event.isError ? 'tool-accordion error-accordion' : 'tool-accordion',
       });
       addCodeBlock(body, event.content || '(empty)', { isError: event.isError });
-      timeline.appendChild(card);
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
@@ -487,17 +489,10 @@
       if (event.durationMs) statDuration.textContent = formatDuration(event.durationMs);
       if (event.numTurns) statTurns.textContent = event.numTurns;
 
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'END', badgeClass: 'system',
-        title: event.isError ? 'Session ended with error' : 'Session complete',
-      });
-      if (event.result) {
-        const content = document.createElement('div');
-        content.className = 'text-content';
-        content.textContent = truncateText(event.result, 500);
-        body.appendChild(content);
-      }
-      timeline.appendChild(card);
+      const label = event.isError ? 'Session ended with error' : 'Session complete';
+      const { row, divider } = createSystemDivider(event.ts, label);
+      if (event.costUsd) divider.textContent += ` \u00b7 $${event.costUsd.toFixed(4)}`;
+      timeline.appendChild(row);
       sessionEnded = true;
       statusDot.className = 'status-dot ended';
       statusText.textContent = 'Session ended';
@@ -510,12 +505,8 @@
       sessionEnded = true;
       statusDot.className = 'status-dot ended';
       statusText.textContent = 'Session complete';
-
-      const { card } = createCard(kind, event.ts, {
-        badge: 'DONE', badgeClass: 'system',
-        title: 'Pipe closed — session complete',
-      });
-      timeline.appendChild(card);
+      const { row } = createSystemDivider(event.ts, 'Session complete');
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
@@ -523,48 +514,30 @@
     if (kind === 'session_resumed') {
       statusDot.className = 'status-dot streaming';
       statusText.textContent = 'Resumed';
-
-      const { card } = createCard(kind, event.ts, {
-        badge: 'RESUME', badgeClass: 'system',
-        title: 'Session resumed',
-      });
-      timeline.appendChild(card);
+      const { row } = createSystemDivider(event.ts, 'Session resumed');
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
 
     if (kind === 'approval_granted') {
-      const { card } = createCard(kind, event.ts, {
-        badge: 'APPROVED', badgeClass: 'system',
-        title: `Approved: ${event.toolName}`,
-      });
-      timeline.appendChild(card);
+      const { row } = createSystemDivider(event.ts, 'Approved: ' + (event.toolName || ''));
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
 
     if (kind === 'approval_denied') {
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'DENIED', badgeClass: 'error',
-        title: `Denied: ${event.toolName}`,
-      });
-      if (event.message) {
-        const content = document.createElement('div');
-        content.className = 'text-content';
-        content.textContent = event.message;
-        body.appendChild(content);
-      }
-      timeline.appendChild(card);
+      const text = 'Denied: ' + (event.toolName || '') + (event.message ? ' \u2014 ' + event.message : '');
+      const { row } = createSystemDivider(event.ts, text);
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
 
     if (kind === 'session_timeout') {
-      const { card } = createCard(kind, event.ts, {
-        badge: 'TIMEOUT', badgeClass: 'error',
-        title: event.message || 'Session timed out',
-      });
-      timeline.appendChild(card);
+      const { row } = createSystemDivider(event.ts, event.message || 'Session timed out');
+      timeline.appendChild(row);
       statusDot.className = 'status-dot ended';
       statusText.textContent = 'Timed out';
       sessionEnded = true;
@@ -573,11 +546,11 @@
     }
 
     if (kind === 'raw') {
-      const { card, body } = createCard(kind, event.ts, {
-        badge: 'RAW', badgeClass: 'system',
+      const { row, body } = createAccordion(event.ts, 'system', {
+        icon: '\u2026', label: 'Raw event', className: 'tool-accordion',
       });
       addCodeBlock(body, event.text || JSON.stringify(event.data, null, 2));
-      timeline.appendChild(card);
+      timeline.appendChild(row);
       scrollToBottom();
       return;
     }
