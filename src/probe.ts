@@ -160,18 +160,27 @@ async function cmdServe(): Promise<void> {
   const maxSessions = getFlag('--max-sessions');
   if (maxSessions) limits.maxConcurrentSessions = parseInt(maxSessions, 10);
 
+  const startupTimeout = getFlag('--startup-timeout');
+
   const store = new SessionStore(dataDir);
   const server = createServer(port, publicDir, store, {
     claudePath: claudePath || undefined,
     limits: Object.keys(limits).length > 0 ? limits : undefined,
+    startupTimeoutMs: startupTimeout ? parseInt(startupTimeout, 10) * 1000 : undefined,
   });
 
   await server.start();
   const url = `http://localhost:${port}`;
   const sessionCount = store.listSessions().length;
 
+  const orphans = store.listOrphans();
+
   process.stderr.write(`\nprobe server running: ${url}\n`);
-  process.stderr.write(`sessions: ${dataDir} (${sessionCount} saved)\n\n`);
+  process.stderr.write(`sessions: ${dataDir} (${sessionCount} saved)\n`);
+  if (orphans.length > 0) {
+    process.stderr.write(`orphaned: ${orphans.length} recoverable session${orphans.length !== 1 ? 's' : ''}\n`);
+  }
+  process.stderr.write('\n');
 
   if (!noBrowser) {
     const target = sessionCount > 0 ? `${url}/sessions.html` : url;
@@ -249,6 +258,11 @@ async function cmdStatus(): Promise<void> {
   }
   if (s.spawnReason) process.stdout.write(`reason: ${s.spawnReason}\n`);
   if (s.artifactCount) process.stdout.write(`artifacts: ${s.artifactCount} files\n`);
+  if (s.permissionMode) {
+    let modeInfo = `permissions: ${s.permissionMode}`;
+    if (s.permissionMode === 'bypassPermissions') modeInfo += ' (approvals disabled)';
+    process.stdout.write(modeInfo + '\n');
+  }
 
   if (s.stuckForMs && (s.stuckForMs as number) > 30000) {
     process.stdout.write(`warning: no activity for ${formatDuration(s.stuckForMs as number)}\n`);
@@ -459,6 +473,43 @@ async function cmdArtifacts(): Promise<void> {
   process.stdout.write(`\n${byPath.size} files (${artifacts.length} operations)\n`);
 }
 
+async function cmdRecover(): Promise<void> {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe recover: session ID required\n'); process.exit(1); }
+
+  const body: Record<string, unknown> = {};
+  const prompt = getFlag('-p') || getFlag('--prompt');
+  if (prompt) body.prompt = prompt;
+  const model = getFlag('--model');
+  if (model) body.model = model;
+
+  const res = await httpPost(`/api/sessions/${id}/recover`, body);
+  if (res.status !== 200) {
+    process.stderr.write(`probe recover: ${asRecord(res.data).error || 'failed'}\n`);
+    process.exit(1);
+  }
+  const d = asRecord(res.data);
+  process.stdout.write(`recovered → ${d.newSessionId}\n`);
+  process.stdout.write(`claude session: ${d.claudeSessionId}\n`);
+}
+
+async function cmdReplay(): Promise<void> {
+  const id = args[1];
+  if (!id) { process.stderr.write('probe replay: session ID required\n'); process.exit(1); }
+
+  const body: Record<string, unknown> = {};
+  const speed = getFlag('--speed');
+  if (speed) body.speed = parseFloat(speed);
+
+  const res = await httpPost(`/api/sessions/${id}/replay`, body);
+  if (res.status !== 200) {
+    process.stderr.write(`probe replay: ${asRecord(res.data).error || 'failed'}\n`);
+    process.exit(1);
+  }
+  const d = asRecord(res.data);
+  process.stdout.write(`replay → ${d.replaySessionId} (${d.eventCount} events at ${d.speed}x)\n`);
+}
+
 async function cmdSessions(): Promise<void> {
   const res = await httpGet('/api/sessions');
   if (res.status !== 200) {
@@ -479,7 +530,8 @@ async function cmdSessions(): Promise<void> {
 
   for (const s of sessions) {
     let line = `${s.id}`;
-    if (s.status) line += ` [${s.status}]`;
+    if (s.recoverable) line += ' [recoverable]';
+    else if (s.status) line += ` [${s.status}]`;
     else if (s.ended) line += ' [done]';
     if (s.model) line += ` ${s.model}`;
     if (s.costUsd) line += ` ${formatCost(s.costUsd as number)}`;
@@ -697,6 +749,8 @@ Commands:
   result <id>                   Get final result text
   sessions                      List all sessions
   artifacts <id>                List files created/modified/read
+  recover <id>                  Recover an orphaned session (resume Claude)
+  replay <id> [--speed N]       Replay a session through the dashboard
   doctor                        Server/session health diagnostics
   policy add --tool <pattern>   Add approval policy (e.g. "Write", "*")
   policy list                   List active policies
@@ -712,6 +766,13 @@ Options for 'new':
   --max-cost <usd>              Per-session cost cap (e.g. 0.50)
   --max-turns <n>               Per-session turn limit
 
+Options for 'recover':
+  -p, --prompt <text>           Override resume prompt
+  --model <model>               Override model
+
+Options for 'replay':
+  --speed <N>                   Playback speed multiplier (default: 10)
+
 Options for 'close':
   --tree                        Also close all child sessions
 
@@ -719,6 +780,7 @@ Options for 'sessions':
   --tree                        Show parent/child tree view
 
 Options for 'serve':
+  --startup-timeout <seconds>   Max wait for CLI WebSocket connect (default: 90)
   --max-cost <usd>              Global default cost cap per session
   --max-turns <n>               Global default turn limit
   --max-duration <minutes>      Global default duration limit
@@ -780,6 +842,12 @@ switch (command) {
   case 'artifacts':
   case 'files':
     cmdArtifacts();
+    break;
+  case 'recover':
+    cmdRecover();
+    break;
+  case 'replay':
+    cmdReplay();
     break;
   case 'sessions':
   case 'list':

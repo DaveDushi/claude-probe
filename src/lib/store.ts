@@ -19,6 +19,7 @@ export interface SessionSummary {
   cwd: string | null;
   parentSessionId?: string | null;
   artifactCount?: number;
+  recoverable?: boolean;
   // Merged from active sessions at runtime
   status?: string;
   pendingApproval?: unknown;
@@ -168,6 +169,23 @@ export class SessionStore {
     }
 
     return sessions;
+  }
+
+  /** List orphaned sessions (have events but no terminal event, not currently active). */
+  listOrphans(activeSessionIds?: Set<string>): SessionSummary[] {
+    return this.listSessions().filter(s =>
+      !s.ended && s.eventCount > 0 && !(activeSessionIds?.has(s.id))
+    );
+  }
+
+  /** Extract Claude session ID from a session's JSONL (scans for init event). */
+  getClaudeSessionId(sessionId: string): string | null {
+    const events = this.loadSession(sessionId);
+    if (!events) return null;
+    for (const evt of events) {
+      if (evt.kind === 'init' && evt.sessionId) return evt.sessionId as string;
+    }
+    return null;
   }
 
   /** Delete a session's log file. */

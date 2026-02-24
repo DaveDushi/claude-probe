@@ -28,13 +28,24 @@ export function parseLine(line: string): ProbeEvent[] {
   const type = obj.type as string;
 
   if (type === 'system') {
-    return [makeEvent('init', {
-      subtype: obj.subtype,
-      sessionId: obj.session_id,
-      model: obj.model,
-      tools: obj.tools || [],
-      mcp_servers: obj.mcp_servers || [],
-    })];
+    const subtype = obj.subtype as string;
+    if (subtype === 'init') {
+      return [makeEvent('init', {
+        subtype,
+        sessionId: obj.session_id,
+        model: obj.model,
+        tools: obj.tools || [],
+        mcp_servers: obj.mcp_servers || [],
+      })];
+    }
+    if (subtype === 'compact_boundary') {
+      return [makeEvent('compact_boundary', {
+        sessionId: obj.session_id,
+        compactMetadata: obj.compact_metadata,
+      })];
+    }
+    // Unknown system subtype — pass through safely
+    return [makeEvent('system', { subtype, sessionId: obj.session_id, data: obj })];
   }
 
   if (type === 'assistant') {

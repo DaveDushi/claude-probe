@@ -17,7 +17,7 @@ interface TimerEntry {
 export type TimeoutCallback = (sessionId: string, reason: string, message: string) => void;
 
 const DEFAULTS: WatchdogConfig = {
-  startupTimeoutMs: 45_000,
+  startupTimeoutMs: 90_000,
   firstEventTimeoutMs: 60_000,
   heartbeatTimeoutMs: 120_000,
   approvalTimeoutMs: 0, // 0 = disabled
