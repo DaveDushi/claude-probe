@@ -310,7 +310,14 @@ export function createServer(port: number, publicDir: string, store: SessionStor
 
     session.process = child;
 
-    child.stderr!.on('data', () => {}); // drain stderr
+    // Capture stderr for debugging — store last chunk on session
+    let stderrBuf = '';
+    child.stderr!.on('data', (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      stderrBuf += text;
+      // Keep only last 2KB to avoid memory bloat
+      if (stderrBuf.length > 2048) stderrBuf = stderrBuf.slice(-2048);
+    });
     child.stdout!.on('data', () => {}); // drain stdout
 
     child.on('error', (err: Error) => {
@@ -319,13 +326,22 @@ export function createServer(port: number, publicDir: string, store: SessionStor
       session.status = 'error';
       session.errorCode = 'spawn_error';
       session.error = `Failed to spawn claude: ${err.message}`;
+      if (stderrBuf.trim()) session.error += `\nstderr: ${stderrBuf.trim().slice(-500)}`;
       broadcastSessionStatus(session);
     });
 
-    child.on('exit', () => {
+    child.on('exit', (code) => {
       watchdog.untrack(session.sessionId);
       if (session.status !== 'error') {
-        session.status = 'done';
+        if (code && code !== 0 && !session.ws) {
+          // Exited with error before WS connected — likely connection failure
+          session.status = 'error';
+          session.errorCode = 'exit_before_connect';
+          session.error = `Claude exited (code ${code}) before WebSocket connected`;
+          if (stderrBuf.trim()) session.error += `\nstderr: ${stderrBuf.trim().slice(-500)}`;
+        } else {
+          session.status = 'done';
+        }
       }
       broadcastSessionStatus(session);
     });
@@ -446,10 +462,10 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     if (!session.pendingApproval || !session.ws) return false;
     const response = JSON.stringify({
       type: 'control_response',
-      request_id: session.pendingApproval.requestId,
       response: {
-        behavior: 'allow',
-        updatedInput: session.pendingApproval.input,
+        subtype: 'success',
+        request_id: session.pendingApproval.requestId,
+        response: { behavior: 'allow' },
       },
     }) + '\n';
     session.ws.send(response);
@@ -476,10 +492,13 @@ export function createServer(port: number, publicDir: string, store: SessionStor
     if (!session.pendingApproval || !session.ws) return false;
     const response = JSON.stringify({
       type: 'control_response',
-      request_id: session.pendingApproval.requestId,
       response: {
-        behavior: 'deny',
-        message: message || 'Denied by user',
+        subtype: 'success',
+        request_id: session.pendingApproval.requestId,
+        response: {
+          behavior: 'deny',
+          message: message || 'Denied by user',
+        },
       },
     }) + '\n';
     session.ws.send(response);
@@ -1331,14 +1350,14 @@ export function createServer(port: number, publicDir: string, store: SessionStor
         if (obj.type === 'control_request') {
           const request = obj.request as Record<string, unknown> | undefined;
 
-          // Safe fallback: malformed control_request → deny with structured error
+          // Safe fallback: malformed control_request → error response
           if (!request || !request.subtype || !obj.request_id) {
             const errorResponse = JSON.stringify({
               type: 'control_response',
-              request_id: obj.request_id || 'unknown',
               response: {
-                behavior: 'deny',
-                message: 'Malformed control_request: missing request or request_id',
+                subtype: 'error',
+                request_id: obj.request_id || 'unknown',
+                error: 'Malformed control_request: missing request or request_id',
               },
             }) + '\n';
             ws.send(errorResponse);
@@ -1347,8 +1366,8 @@ export function createServer(port: number, publicDir: string, store: SessionStor
 
           if (request.subtype === 'can_use_tool') {
             const toolName = (request.tool_name as string) || 'unknown';
-            // Normalize tool input: ensure it's at least an empty object
-            const toolInput = request.tool_input ?? {};
+            // Protocol uses request.input (not tool_input)
+            const toolInput = request.input ?? {};
             const requestId = obj.request_id as string;
 
             if (session && !session.autoApprove) {
@@ -1359,10 +1378,10 @@ export function createServer(port: number, publicDir: string, store: SessionStor
                 // Policy auto-approves this tool use
                 const response = JSON.stringify({
                   type: 'control_response',
-                  request_id: requestId,
                   response: {
-                    behavior: 'allow',
-                    updatedInput: toolInput,
+                    subtype: 'success',
+                    request_id: requestId,
+                    response: { behavior: 'allow' },
                   },
                 }) + '\n';
                 ws.send(response);
@@ -1407,10 +1426,10 @@ export function createServer(port: number, publicDir: string, store: SessionStor
               // Auto-approve (session-level flag)
               const response = JSON.stringify({
                 type: 'control_response',
-                request_id: requestId,
                 response: {
-                  behavior: 'allow',
-                  updatedInput: toolInput,
+                  subtype: 'success',
+                  request_id: requestId,
+                  response: { behavior: 'allow' },
                 },
               }) + '\n';
               ws.send(response);
@@ -1418,13 +1437,13 @@ export function createServer(port: number, publicDir: string, store: SessionStor
             continue;
           }
 
-          // Unknown control_request subtype → deny safely
+          // Unknown control_request subtype → error response
           const fallbackResponse = JSON.stringify({
             type: 'control_response',
-            request_id: obj.request_id,
             response: {
-              behavior: 'deny',
-              message: `Unknown control_request subtype: ${request.subtype}`,
+              subtype: 'error',
+              request_id: obj.request_id as string,
+              error: `Unknown control_request subtype: ${request.subtype}`,
             },
           }) + '\n';
           ws.send(fallbackResponse);
