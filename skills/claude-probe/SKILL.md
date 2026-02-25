@@ -4,10 +4,14 @@ description: "Spawn, monitor, and orchestrate Claude Code sessions as background
   processes via the probe CLI or HTTP API. Use when you need to: run tasks through
   subordinate Claude Code sessions (probe new), poll status and wait for completion
   (probe status, probe result), send multi-turn follow-ups (probe send), run parallel
-  multi-agent workflows, enforce cost/turn/concurrency budgets, recover from session
-  failures with retry logic, approve or deny tool use (probe approve, probe deny),
-  or set up Claude Code project infrastructure for a codebase being built through
-  probe (CLAUDE.md, slash commands, subagents, hooks, settings, MCP servers)."
+  multi-agent workflows, enforce cost/turn/concurrency budgets, recover orphaned
+  sessions (probe recover), replay sessions through the dashboard (probe replay),
+  inspect file artifacts (probe artifacts), manage approval policies (probe policy
+  add/list/remove), approve or deny tool use (probe approve, probe deny), use the
+  Dalton adapter to execute Dalton-managed tasks as Probe sessions (probe dalton
+  work, probe dalton status, probe dalton check), or set up Claude Code project
+  infrastructure for a codebase being built through probe (CLAUDE.md, slash commands,
+  subagents, hooks, settings, MCP servers)."
 license: MIT
 metadata:
   openclaw:
@@ -75,6 +79,7 @@ These come from real-world stress testing of the manager/developer model:
 ```bash
 # Server
 probe serve --no-browser            # start server (headless)
+probe shutdown                      # stop server and free port
 
 # Sessions
 probe new -p "..." --cwd ./project --auto-approve   # spawn
@@ -83,12 +88,32 @@ probe status <id>                   # check status + phase
 probe result <id>                   # get final output
 probe events <id> --last 10         # recent activity
 probe sessions                      # list all
+probe sessions --tree               # list with parent/child tree
 
 # Control
 probe approve <id>                  # approve pending tool use
 probe deny <id>                     # deny pending tool use
 probe close <id>                    # stop session
+probe close <id> --tree             # stop session + all children
 probe doctor                        # health check
+
+# Recovery & Replay
+probe recover <id>                  # recover orphaned session (resume Claude)
+probe replay <id> --speed 10        # replay session through dashboard
+probe artifacts <id>                # list files created/modified/read
+
+# Policies
+probe policy add --tool "Write"     # allow tool globally
+probe policy add --tool "*" --session <id>  # allow all tools for session
+probe policy list                   # list active policies
+probe policy remove <id>            # remove a policy
+
+# Dalton Adapter
+probe dalton init --cwd . --phases 3  # scaffold .dalton/ with 3 phase files
+probe dalton add --phase 1 --title "Set up auth" --priority high  # add task
+probe dalton work [task-id] --cwd . --auto-approve  # start next/specific task
+probe dalton status --cwd .         # show task/session progress
+probe dalton check [task-id] --cwd .  # evaluate done gate, mark complete
 ```
 
 See [references/cli-reference.md](references/cli-reference.md) for full flag tables, HTTP API endpoints, and status field details.
@@ -265,6 +290,46 @@ probe new -p "..." --auto-approve -- --max-budget-usd 2.00
 ```
 
 See [references/claude-code-features.md](references/claude-code-features.md) for concrete examples of each pattern.
+
+## Dalton Adapter
+
+Bridges Dalton markdown-based task management with Probe sessions. The manager agent initializes a task list, adds tasks, then hands off execution to probe sessions — no need to hold plans in context across conversations.
+
+### Setup
+
+```bash
+# Initialize .dalton/ in a project
+probe dalton init --cwd ./project --phases 2
+
+# Add tasks
+probe dalton add --phase 1 --title "Set up database schema" --priority high --effort medium \
+  --description "Create PostgreSQL schema for users and sessions" \
+  --criteria "migrations run cleanly,schema matches ERD"
+probe dalton add --phase 1 --title "Add auth endpoints" --priority high --deps "p1-1" \
+  --criteria "login returns JWT,refresh token works"
+probe dalton add --phase 2 --title "Build dashboard UI" --priority medium --deps "p1-2"
+```
+
+This creates:
+```
+.dalton/
+  state.json              # tracks current phase, completed tasks, in-progress
+  probe-mapping.json      # tracks task → probe session links
+  phases/
+    phase_1.md            # task definitions in structured markdown
+    phase_2.md
+```
+
+### Workflow
+
+1. **Init**: `probe dalton init --cwd ./project` scaffolds `.dalton/`.
+2. **Add tasks**: `probe dalton add --phase N --title "..."` appends tasks (auto-assigns sequential IDs like `p1-1`, `p1-2`).
+3. **Execute**: `probe dalton work --cwd ./project --auto-approve` picks the next pending task (respects dependency order and priority), spawns a probe session for it.
+4. **Monitor**: `probe dalton status --cwd ./project` shows phase progress and linked session status.
+5. **Check completion**: `probe dalton check --cwd ./project` evaluates the done gate. If passed, marks the task completed across all state files.
+6. **Repeat**: Loop steps 3-5 until all tasks in the phase are complete.
+
+Deduplication is built in — if a task already has an active session, `dalton work` returns the existing session ID instead of spawning a duplicate.
 
 ## References
 

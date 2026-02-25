@@ -732,6 +732,234 @@ async function cmdPolicyRemove(): Promise<void> {
   process.stdout.write('removed\n');
 }
 
+// ================================================================
+// Dalton commands
+// ================================================================
+
+async function cmdDaltonWork(): Promise<void> {
+  const {
+    readDaltonState, writeDaltonState, readMapping,
+    getTask, getNextTask, getSessionForTask,
+    buildTaskPrompt, linkTaskToSession, updateTaskStatus,
+  } = await import('./lib/dalton');
+
+  const cwd = path.resolve(getFlag('--cwd') || process.cwd());
+  const state = readDaltonState(cwd);
+  if (!state) {
+    process.stderr.write(`probe dalton: no .dalton/state.json in ${cwd}\n`);
+    process.exit(1);
+  }
+
+  // Resolve task
+  const taskId = args[1];
+  const task = taskId ? getTask(cwd, taskId) : getNextTask(cwd);
+  if (!task) {
+    process.stderr.write(taskId ? `probe dalton: task ${taskId} not found\n` : 'probe dalton: no pending tasks\n');
+    process.exit(1);
+  }
+
+  // Deduplicate — refuse if active session exists
+  const existing = getSessionForTask(cwd, task.id);
+  if (existing && existing.status === 'active') {
+    process.stdout.write(`${existing.probeSessionId}\n`);
+    process.stderr.write(`probe dalton: task ${task.id} already has active session\n`);
+    return;
+  }
+
+  // Build prompt and create session
+  const prompt = buildTaskPrompt(task, cwd);
+  const body: Record<string, unknown> = { prompt, cwd };
+
+  const model = getFlag('--model');
+  if (model) body.model = model;
+  if (hasFlag('--auto-approve')) body.autoApprove = true;
+  const maxTurns = getFlag('--max-turns');
+  if (maxTurns) body.limits = { maxTurns: parseInt(maxTurns, 10) };
+  const maxCost = getFlag('--max-cost');
+  if (maxCost) {
+    body.limits = { ...(body.limits as Record<string, unknown> || {}), maxCostUsd: parseFloat(maxCost) };
+  }
+
+  // Permission flags
+  const flags: string[] = [];
+  if (hasFlag('--dangerously-skip-permissions')) flags.push('--dangerously-skip-permissions');
+  const permMode = getFlag('--permission-mode');
+  if (permMode) flags.push('--permission-mode', permMode);
+  if (flags.length) body.flags = flags;
+
+  const res = await httpPost('/api/sessions', body);
+  if (res.status !== 200) {
+    process.stderr.write(`probe dalton: ${asRecord(res.data).error || 'failed to create session'}\n`);
+    process.exit(1);
+  }
+
+  const sessionId = asRecord(res.data).sessionId as string;
+
+  // Record mapping
+  linkTaskToSession(cwd, task.id, sessionId);
+
+  // Update Dalton state
+  state.in_progress = task.id;
+  writeDaltonState(cwd, state);
+  updateTaskStatus(cwd, task.id, 'in_progress');
+
+  process.stdout.write(`${sessionId}\n`);
+}
+
+async function cmdDaltonStatus(): Promise<void> {
+  const {
+    readDaltonState, readMapping, parsePhaseFile,
+  } = await import('./lib/dalton');
+
+  const cwd = path.resolve(getFlag('--cwd') || process.cwd());
+  const state = readDaltonState(cwd);
+  if (!state) {
+    process.stderr.write(`probe dalton: no .dalton/state.json in ${cwd}\n`);
+    process.exit(1);
+  }
+
+  const mapping = readMapping(cwd);
+  const tasks = parsePhaseFile(cwd, state.current_phase);
+
+  const completed = tasks.filter(t => t.status === 'completed').length;
+  process.stdout.write(`phase: ${state.current_phase} (${completed}/${tasks.length} complete)\n`);
+
+  // Show in-progress task with session status
+  if (state.in_progress) {
+    const task = tasks.find(t => t.id === state.in_progress);
+    const taskTitle = task ? `"${task.title}"` : '';
+    let line = `in_progress: ${state.in_progress} ${taskTitle}`;
+
+    const m = mapping.tasks[state.in_progress];
+    if (m && m.status === 'active') {
+      try {
+        const statusRes = await httpGet(`/api/sessions/${m.probeSessionId}/status`);
+        if (statusRes.status === 200) {
+          const s = asRecord(statusRes.data);
+          line += `\n  session: ${m.probeSessionId} [${s.status}]`;
+          if (s.costUsd) line += ` cost=${formatCost(s.costUsd as number)}`;
+          if (s.turns) line += ` turns=${s.turns}`;
+          if (s.toolCalls) line += ` tools=${s.toolCalls}`;
+          if (s.stuckForMs && (s.stuckForMs as number) > 30000) {
+            line += ` stuck=${formatDuration(s.stuckForMs as number)}`;
+          }
+        }
+      } catch {
+        line += `\n  session: ${m.probeSessionId} [unreachable]`;
+      }
+    } else if (m) {
+      line += `\n  session: ${m.probeSessionId} [${m.status}]`;
+    }
+
+    process.stdout.write(line + '\n');
+  }
+
+  // Show pending tasks
+  const pending = tasks.filter(t => t.status === 'pending');
+  for (const t of pending) {
+    process.stdout.write(`pending: ${t.id} "${t.title}"\n`);
+  }
+}
+
+async function cmdDaltonCheck(): Promise<void> {
+  const {
+    readDaltonState, evaluateDoneGate,
+    completeDaltonTask, failDaltonTask, getSessionForTask,
+  } = await import('./lib/dalton');
+
+  const cwd = path.resolve(getFlag('--cwd') || process.cwd());
+  const state = readDaltonState(cwd);
+  if (!state) {
+    process.stderr.write(`probe dalton: no .dalton/state.json in ${cwd}\n`);
+    process.exit(1);
+  }
+
+  const taskId = args[1] || state.in_progress;
+  if (!taskId) {
+    process.stderr.write('probe dalton check: task ID required (or have an in_progress task)\n');
+    process.exit(1);
+  }
+
+  const mapping = getSessionForTask(cwd, taskId);
+  if (!mapping) {
+    process.stderr.write(`probe dalton check: no session mapped to ${taskId}\n`);
+    process.exit(1);
+  }
+
+  const gate = await evaluateDoneGate(httpGet, cwd, taskId);
+
+  if (gate.passed) {
+    completeDaltonTask(cwd, taskId, gate.resultText);
+    process.stdout.write(`DONE ${taskId}\n`);
+    if (gate.resultText) {
+      const preview = gate.resultText.replace(/\n/g, ' ').trim();
+      process.stdout.write(`  result: ${preview.length > 200 ? preview.slice(0, 200) + '...' : preview}\n`);
+    }
+  } else {
+    // If session errored/failed, mark the mapping as failed
+    if (gate.sessionStatus === 'error' || gate.sessionStatus === 'done') {
+      if (!gate.passed && gate.sessionStatus === 'error') {
+        failDaltonTask(cwd, taskId, gate.reasons.join('; '));
+      }
+    }
+    process.stdout.write(`NOT_DONE ${taskId}\n`);
+    for (const r of gate.reasons) {
+      process.stdout.write(`  ${r}\n`);
+    }
+  }
+}
+
+async function cmdDaltonInit(): Promise<void> {
+  const { initDalton } = await import('./lib/dalton');
+
+  const cwd = path.resolve(getFlag('--cwd') || process.cwd());
+  const phases = parseInt(getFlag('--phases') || '1', 10);
+
+  try {
+    initDalton(cwd, phases);
+  } catch (err: unknown) {
+    process.stderr.write(`probe dalton init: ${(err as Error).message}\n`);
+    process.exit(1);
+  }
+
+  process.stdout.write(`initialized .dalton/ in ${cwd} (${phases} phase${phases !== 1 ? 's' : ''})\n`);
+}
+
+async function cmdDaltonAdd(): Promise<void> {
+  const { addTask } = await import('./lib/dalton');
+
+  const cwd = path.resolve(getFlag('--cwd') || process.cwd());
+  const phase = getFlag('--phase');
+  const title = getFlag('--title');
+
+  if (!phase || !title) {
+    process.stderr.write('probe dalton add: --phase <N> and --title "..." required\n');
+    process.exit(1);
+  }
+
+  const deps = getFlag('--deps');
+  const criteria = getFlag('--criteria');
+
+  let taskId: string;
+  try {
+    taskId = addTask(cwd, {
+      phase: parseInt(phase, 10),
+      title,
+      type: getFlag('--type') || undefined,
+      priority: getFlag('--priority') || undefined,
+      effort: getFlag('--effort') || undefined,
+      description: getFlag('--description') || undefined,
+      dependencies: deps ? deps.split(',').map(d => d.trim()) : undefined,
+      acceptanceCriteria: criteria ? criteria.split(',').map(c => c.trim()) : undefined,
+    });
+  } catch (err: unknown) {
+    process.stderr.write(`probe dalton add: ${(err as Error).message}\n`);
+    process.exit(1);
+  }
+
+  process.stdout.write(`${taskId}\n`);
+}
+
 function printUsage(): void {
   process.stderr.write(`
 claude-probe - control Claude Code sessions
@@ -755,6 +983,11 @@ Commands:
   policy add --tool <pattern>   Add approval policy (e.g. "Write", "*")
   policy list                   List active policies
   policy remove <id>            Remove a policy
+  dalton init                   Initialize .dalton/ directory
+  dalton add --phase N --title "..."   Add a task to a phase
+  dalton work [task-id]         Start a Dalton task as a Probe session
+  dalton status                 Show Dalton task/session progress
+  dalton check [task-id]        Evaluate done gate, mark task complete
 
 Options for 'new':
   --model <model>               Claude model to use
@@ -785,6 +1018,34 @@ Options for 'serve':
   --max-turns <n>               Global default turn limit
   --max-duration <minutes>      Global default duration limit
   --max-sessions <n>            Max concurrent active sessions
+
+Options for 'dalton init':
+  --cwd <dir>                   Project directory (default: cwd)
+  --phases <n>                  Number of phase files to create (default: 1)
+
+Options for 'dalton add':
+  --cwd <dir>                   Project directory (default: cwd)
+  --phase <n>                   Phase number (required)
+  --title <text>                Task title (required)
+  --type <text>                 Task type (default: feature)
+  --priority <low|medium|high>  Task priority (default: medium)
+  --effort <small|medium|large> Task effort (default: medium)
+  --description <text>          Task description
+  --deps <p1-1,p1-2>           Comma-separated dependency IDs
+  --criteria <a,b,c>           Comma-separated acceptance criteria
+
+Options for 'dalton work':
+  --cwd <dir>                   Project directory with .dalton/ (default: cwd)
+  --model <model>               Claude model to use
+  --auto-approve                Auto-approve all tool use
+  --max-turns <n>               Turn limit for session
+  --max-cost <usd>              Cost cap for session
+
+Options for 'dalton status':
+  --cwd <dir>                   Project directory with .dalton/
+
+Options for 'dalton check':
+  --cwd <dir>                   Project directory with .dalton/
 
 Options for 'policy add':
   --tool <pattern>              Tool name glob ("Write", "Bash", "*")
@@ -866,6 +1127,20 @@ switch (command) {
     else if (subCmd === 'remove' || subCmd === 'rm') cmdPolicyRemove();
     else {
       process.stderr.write('probe policy: subcommand required (add|list|remove)\n');
+      process.exit(1);
+    }
+    break;
+  }
+  case 'dalton': {
+    const daltonSub = args[1];
+    args.splice(0, 1);
+    if (daltonSub === 'work' || daltonSub === 'run') cmdDaltonWork();
+    else if (daltonSub === 'status') cmdDaltonStatus();
+    else if (daltonSub === 'check') cmdDaltonCheck();
+    else if (daltonSub === 'init') cmdDaltonInit();
+    else if (daltonSub === 'add') cmdDaltonAdd();
+    else {
+      process.stderr.write('probe dalton: subcommand required (init|add|work|status|check)\n');
       process.exit(1);
     }
     break;
