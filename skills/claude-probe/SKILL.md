@@ -1,12 +1,17 @@
----
+﻿---
 name: claude-probe
-description: Spawn, monitor, and control Claude Code sessions from the CLI or HTTP API with a real-time browser dashboard.
-version: 2.1.0
-user-invocable: true
-homepage: https://github.com/DaveDushi/claude-probe
+description: "Spawn, monitor, and orchestrate Claude Code sessions as background
+  processes via the probe CLI or HTTP API. Use when you need to: run tasks through
+  subordinate Claude Code sessions (probe new), poll status and wait for completion
+  (probe status, probe result), send multi-turn follow-ups (probe send), run parallel
+  multi-agent workflows, enforce cost/turn/concurrency budgets, recover from session
+  failures with retry logic, approve or deny tool use (probe approve, probe deny),
+  or set up Claude Code project infrastructure for a codebase being built through
+  probe (CLAUDE.md, slash commands, subagents, hooks, settings, MCP servers)."
+license: MIT
 metadata:
   openclaw:
-    emoji: "🔬"
+    emoji: "\U0001F52C"
     homepage: https://github.com/DaveDushi/claude-probe
     os:
       - darwin
@@ -20,7 +25,7 @@ metadata:
     install:
       - id: npm-global
         kind: node
-        package: github:DaveDushi/claude-probe
+        package: "github:DaveDushi/claude-probe"
         bins:
           - probe
         label: Install via npm (from GitHub)
@@ -28,280 +33,246 @@ metadata:
 
 # claude-probe
 
-CLI + browser dashboard for controlling and monitoring Claude Code sessions.
+CLI + browser dashboard for spawning and controlling Claude Code sessions as background processes.
 
-Spawn isolated Claude Code sessions as background processes, monitor them in real-time through a browser dashboard, and control tool permissions -- all from the command line or HTTP API.
-
-## MANDATORY: Probe-Only Execution
+## Probe-Only Execution
 
 **ALL work MUST go through probe sessions. NEVER bypass probe to do work directly.**
 
-You are an orchestrator. Your job is to plan work, spawn probe sessions to execute it, and verify the results. You do not write code, edit files, or run commands yourself -- probe sessions do that for you.
+You are an orchestrator. Plan work, spawn probe sessions to execute it, verify results. You do not write code, edit files, or run commands yourself.
 
-Rules:
-1. Every code change, test run, or file operation goes through `probe new` or `probe send`.
-2. If a session fails, diagnose with `probe doctor` and retry. Do NOT fall back to doing the work yourself.
-3. If the server is not running, start it with `probe serve --no-browser` first.
+1. Every code change, test run, or file operation → `probe new` or `probe send`.
+2. If a session fails → diagnose with `probe doctor`, retry. Do NOT fall back to doing work yourself.
+3. If the server is not running → `probe serve --no-browser` first.
 4. Reading probe output (status, events, result) is orchestration, not bypassing.
-5. Always use `--auto-approve` for autonomous sessions. This correctly sets `--permission-mode bypassPermissions` on the subprocess.
+5. Always use `--auto-approve` for autonomous sessions (sets `--permission-mode bypassPermissions`).
 
-## Patience and Retry Protocol
+## Retry Protocol
 
 Sessions take time. The Claude Code subprocess must spawn, connect via WebSocket, and begin processing.
 
-**Do NOT give up after one failure.** Follow this escalation:
+1. **Wait** — sessions in `starting` may take up to 45s. Poll with `probe status` every 5-10s.
+2. **Check phase** — status includes `phase` (`waiting_for_ws`, `initializing`, `processing`). Use it.
+3. **Diagnose** — run `probe doctor` if a session errors or seems stuck.
+4. **Retry** — if errorCode is `startup_timeout`, `first_event_timeout`, or `heartbeat_timeout`, close and respawn.
+5. **Limit** — up to 3 retries per task. Always `probe doctor` between retries.
+6. **Never bypass** — after 3 failures, report to the user. Do not do the work yourself.
 
-1. **Wait** -- sessions in `starting` may take up to 45 seconds. Poll with `probe status` every 5-10 seconds.
-2. **Check phase** -- status now includes `phase` (`waiting_for_ws`, `initializing`, `processing`). Use it.
-3. **Diagnose** -- run `probe doctor` if a session errors or seems stuck.
-4. **Retry** -- if errorCode is `startup_timeout`, `first_event_timeout`, or `heartbeat_timeout`, close and respawn. Transient failures are common.
-5. **Retry limit** -- up to 3 retries per task. Always run `probe doctor` between retries.
-6. **Never bypass** -- after 3 failures, report the issue to the user. Do not do the work yourself.
+## Avoiding Common Mistakes
 
-## Setup
+These come from real-world stress testing of the manager/developer model:
 
-Install globally:
+- **Check before spawning.** Run `probe sessions` first. If a session for the same objective already exists in `starting`/`running`/`idle`, don't spawn a duplicate — join it with `probe send` or close it first.
+- **`idle` ≠ `done`.** `idle` means a turn completed but the process is alive and can receive more prompts. `done` means the process exited. When the objective is achieved, run `probe close <id>` explicitly.
+- **Plan before you build.** Spawn a `--permission-mode plan` session first to explore and produce a plan (read-only, no writes). Review the plan with `probe result`, refine with `probe send` if needed, then spawn a separate `--auto-approve` session to implement. This prevents wasted builds.
+- **Cap turns.** Use `--max-turns 5` for planning sessions, `--max-turns 20` for implementation. Prevents runaway token burn.
+- **Verify before declaring success.** After a session finishes, always call `probe result <id>` and check that it actually produced the expected output. A session that reports success but made zero edits may have done nothing.
+- **One writer per workspace.** Don't run two implementation sessions writing to the same directory simultaneously — they'll conflict. Parallel sessions should work on different paths or one should be read-only.
+- **Close when done.** Always `probe close` completed sessions. Leaving sessions in `idle` wastes resources and confuses status checks.
 
-```bash
-npm install -g github:DaveDushi/claude-probe
-```
-
-Or run with npx:
-
-```bash
-npx github:DaveDushi/claude-probe serve
-```
-
-Requires **Node.js >= 18** and the **Claude Code CLI** installed and authenticated.
-
-## Usage
-
-### Starting the server
+## Quick Reference
 
 ```bash
-probe serve
+# Server
+probe serve --no-browser            # start server (headless)
+
+# Sessions
+probe new -p "..." --cwd ./project --auto-approve   # spawn
+probe send <id> -p "..."            # follow-up message
+probe status <id>                   # check status + phase
+probe result <id>                   # get final output
+probe events <id> --last 10         # recent activity
+probe sessions                      # list all
+
+# Control
+probe approve <id>                  # approve pending tool use
+probe deny <id>                     # deny pending tool use
+probe close <id>                    # stop session
+probe doctor                        # health check
 ```
 
-This starts the HTTP + WebSocket server and opens the browser dashboard.
-
-### Spawning sessions
-
-```bash
-probe new -p "Fix the authentication bug in auth.py" --cwd /my/project --auto-approve
-```
-
-Flags:
-
-| Flag | Purpose |
-|------|---------|
-| `-p, --prompt "text"` | Prompt for the session (required) |
-| `--model <model>` | Claude model to use |
-| `--auto-approve` | Auto-approve all tool use + set `--permission-mode bypassPermissions` |
-| `--cwd <dir>` | Working directory for the Claude process |
-| `-r, --resume <id>` | Resume an existing session |
-| `--permission-mode <mode>` | Passthrough to Claude CLI (overrides auto-approve default) |
-| `--allowedTools <tools>` | Passthrough to Claude CLI |
-| `--dangerously-skip-permissions` | Passthrough to Claude CLI |
-
-### Monitoring and control
-
-```bash
-probe status <session-id>
-probe events <session-id> --last 10
-probe result <session-id>
-probe doctor                        # server + session health check
-```
-
-### Multi-turn conversations
-
-```bash
-probe send <session-id> -p "Now add tests for that fix"
-```
-
-### Tool permission gating
-
-```bash
-probe approve <session-id>
-probe deny <session-id>
-```
-
-### Session management
-
-```bash
-probe sessions                      # list all sessions
-probe close <session-id>            # stop a session
-probe doctor                        # diagnose server and session health
-```
-
-## HTTP API
-
-All commands are also available via HTTP for scripts and agent orchestration:
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/health` | Health check |
-| `GET` | `/api/diagnostics` | Server and session health diagnostics |
-| `POST` | `/api/sessions` | Create session |
-| `GET` | `/api/sessions` | List all sessions |
-| `GET` | `/api/sessions/:id/status` | Get session status, phase, stuck detection |
-| `GET` | `/api/sessions/:id/events` | Get session events |
-| `GET` | `/api/sessions/:id/result` | Get final result |
-| `POST` | `/api/sessions/:id/message` | Send follow-up message |
-| `POST` | `/api/sessions/:id/approve` | Approve pending tool use |
-| `POST` | `/api/sessions/:id/deny` | Deny pending tool use |
-| `POST` | `/api/sessions/:id/close` | Kill session process |
-| `DELETE` | `/api/sessions/:id` | Delete session and data |
-
-## Server flags
-
-| Flag | Purpose |
-|------|---------|
-| `--port <port>` | Server port (default: 3456) |
-| `--data-dir <dir>` | Session storage directory |
-| `--no-browser` | Don't auto-open the dashboard |
-| `--claude-path <path>` | Custom path to the claude binary |
+See [references/cli-reference.md](references/cli-reference.md) for full flag tables, HTTP API endpoints, and status field details.
 
 ## Session Lifecycle
 
 ```
-starting --> running --> idle              (turn complete)
+starting --> running --> idle              (turn complete, can receive more)
                      --> waiting_approval   (tool needs approval)
                      --> done               (process exited)
                      --> error              (spawn failed or timeout)
 
-Watchdog timeouts (automatic):
+Timeouts:
   starting --[45s]--> error (startup_timeout)
   running  --[60s]--> error (first_event_timeout)
   running  --[120s]-> error (heartbeat_timeout)
 ```
 
-### Enriched Status
+## Troubleshooting
 
-`probe status` now includes:
-- `phase`: sub-state (`waiting_for_ws`, `initializing`, `processing`, `awaiting_approval`)
-- `stuckForMs`: ms since last activity (warning if > 30s)
-- `errorCode`: structured error type (`startup_timeout`, `first_event_timeout`, `heartbeat_timeout`, `spawn_error`)
-- `lastActivityAt`: timestamp of last event
-
-### New Events
-
-| Event | When |
-|-------|------|
-| `session_timeout` | Watchdog timeout (includes `reason`, `message`) |
-| `approval_granted` | Tool-use request approved |
-| `approval_denied` | Tool-use request denied |
-
-## Diagnostics
-
-### `probe doctor`
-
-Checks server reachability, detailed session diagnostics (process alive, WS connected, stuck detection), and WebSocket connectivity. Run this whenever a session misbehaves -- before retrying.
-
-### Troubleshooting Quick Reference
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Session stuck in "starting" | WS never connected | `probe doctor`, verify `claude` CLI, retry |
-| `startup_timeout` error | 45s elapsed without WS | Close and respawn |
-| `heartbeat_timeout` error | 120s no events | Check `probe doctor` for proc/ws status, retry |
-| `spawn_error` | Claude binary not found | Check `claude --version`, use `--claude-path` |
-| Server unreachable | Server not running | `probe serve --no-browser` |
-| ZodError on tool calls | Permission mode mismatch | Use `--auto-approve` (auto-sets bypassPermissions) |
+| Symptom | Fix |
+|---------|-----|
+| Stuck in "starting" | `probe doctor`, verify `claude` CLI works, retry |
+| `startup_timeout` | Close and respawn |
+| `heartbeat_timeout` | `probe doctor` for proc/ws status, retry |
+| `spawn_error` | Check `claude --version`, use `--claude-path` |
+| Server unreachable | `probe serve --no-browser` |
+| ZodError on tool calls | Use `--auto-approve` |
 
 ## Workflow: Plan, Execute, Verify
 
-Always follow this three-phase workflow when using claude-probe. This is not optional. Every task must go through all three phases. Skipping phases or bypassing probe to do work directly defeats the purpose of using this skill.
+Every task goes through all three phases. No exceptions.
 
-### Phase 1: Plan
+### Phase 1: Plan (use Claude Code's plan mode)
 
-Before spawning any session, think through:
-
-1. **What needs to happen?** Break the task into discrete, testable steps.
-2. **What order?** Identify dependencies between steps. Independent steps can run in parallel.
-3. **What could go wrong?** Anticipate failure modes and how you'll detect them.
-4. **What does success look like?** Define concrete verification criteria for each step.
-
-Write your plan out explicitly. For example:
-
-```
-Plan:
-1. Read the current auth module to understand the structure
-2. Fix the token refresh race condition in auth.py
-3. Add unit tests covering the race condition
-4. Run the test suite to verify nothing broke
-Verification: all tests pass, token refresh works under concurrent requests
-```
-
-### Phase 2: Execute
-
-Now spawn sessions to carry out each step. Craft prompts that are specific and scoped:
+Spawn a session in **plan mode** so Claude explores the codebase and produces a plan without making changes:
 
 ```bash
-# Bad -- vague, no guardrails
-probe new -p "Fix auth" --cwd ./project --auto-approve
-
-# Good -- specific, scoped, with constraints
-probe new -p "In auth.py, the token refresh at line 84 has a race condition when multiple requests hit refresh simultaneously. Add a lock so only one refresh executes at a time. Do not change the public API." --cwd ./project --auto-approve
+PLAN_ID=$(probe new -p "Plan how to fix the token refresh race condition in auth.py. Explore the codebase, identify affected files, and propose a step-by-step implementation plan." \
+  --cwd ./project --permission-mode plan --max-turns 5)
 ```
 
-Monitor progress as sessions run:
+Key flags: `--permission-mode plan` (read-only, no writes) and `--max-turns 5` (cap exploration).
+
+**Review the plan:**
 
 ```bash
-probe status <session-id>
-probe events <session-id> --last 5
+probe result "$PLAN_ID"
 ```
 
-If a session fails or times out during execution:
+Read the output. If the plan is good, move to Phase 2. If not, refine it:
 
 ```bash
-probe doctor                         # check server health first
-probe close <session-id>             # clean up failed session
-# Retry with the same or refined prompt
-ID=$(probe new -p "..." --cwd ./project --auto-approve)
+probe send "$PLAN_ID" -p "The plan should also cover adding unit tests. And don't touch the public API."
+probe result "$PLAN_ID"
 ```
 
-Do not abandon probe and do the work yourself. Diagnose, retry, and only escalate to the user after 3 failed attempts.
+Iterate until the plan is solid. Only then proceed to build.
+
+### Phase 2: Execute (build from the approved plan)
+
+Once satisfied with the plan, spawn an implementation session with `--auto-approve` and reference the plan:
+
+```bash
+# Feed the approved plan into the build session
+PLAN=$(probe result "$PLAN_ID")
+BUILD_ID=$(probe new -p "Execute this plan: $PLAN" --cwd ./project --auto-approve)
+```
+
+Or give a specific, scoped prompt based on what you learned from the plan:
+
+```bash
+BUILD_ID=$(probe new -p "In auth.py, the token refresh at line 84 has a race condition when multiple requests hit refresh simultaneously. Add a lock so only one refresh executes at a time. Do not change the public API. Then add unit tests covering concurrent refresh." \
+  --cwd ./project --auto-approve)
+```
+
+Monitor progress:
+
+```bash
+probe status "$BUILD_ID"
+probe events "$BUILD_ID" --last 5
+```
+
+On failure: `probe doctor` → `probe close` → respawn with same or refined prompt. Don't bypass probe.
 
 ### Phase 3: Verify
 
-Never trust that a session did the right thing. Always verify:
+Never trust that a session did the right thing.
 
-1. **Read the result** -- check what the session actually did.
+1. **Read the result:**
    ```bash
-   probe result <session-id>
+   probe result <id>
    ```
 
-2. **Run tests** -- spawn a verification session if needed.
+2. **Run tests** (spawn a verification session if needed):
    ```bash
-   probe new -p "Run the full test suite and report any failures" --cwd ./project --auto-approve
+   probe new -p "Run the full test suite and report failures" --cwd ./project --auto-approve
    ```
 
-3. **Diff the changes** -- check that nothing unexpected was modified.
+3. **Diff changes:**
    ```bash
-   probe new -p "Run git diff and summarize all changes made" --cwd ./project --auto-approve
+   probe new -p "Run git diff and summarize all changes" --cwd ./project --auto-approve
    ```
 
-4. **Fix issues** -- if verification fails, diagnose and send a follow-up or spawn a new session.
+4. **Fix issues** (send follow-up or new session):
    ```bash
-   probe send <session-id> -p "The tests in test_auth.py are failing with TimeoutError. Fix the lock implementation."
+   probe send <id> -p "Tests in test_auth.py failing with TimeoutError. Fix the lock."
    ```
 
-Only move on when verification passes. If it doesn't, loop back: re-plan, re-execute, re-verify.
+Only move on when verification passes. Otherwise loop: re-plan → re-execute → re-verify.
 
-## Examples
+## Using Claude Code Features
 
-Spawn a session and wait for the result:
+When building a project through probe, set up the target project to leverage Claude Code properly. This makes every session spawned into that project smarter and more consistent.
 
-```bash
-probe serve --no-browser &
-ID=$(probe new -p "Refactor the utils module" --cwd ./my-project --auto-approve)
-probe result "$ID"
+### CLAUDE.md — Project Instructions
+
+Create a `CLAUDE.md` in the project root with non-obvious rules only. Keep it lean — Claude already knows how to code. Focus on:
+
+- Build/test/lint commands specific to the project
+- Architecture decisions that aren't obvious from the code
+- Naming conventions that deviate from defaults
+- Environment quirks (e.g., "use `py` not `python`")
+
+Don't repeat what's in README or standard docs. Every line costs context window.
+
+### Skills (.claude/skills/)
+
+This is the most important `.claude` subfolder. Store reusable skill packs here and load them into sessions so Claude Code has domain-specific workflows, guardrails, and prompt templates for the project.
+
+You can download preloaded skills from `https://context7.com/skills`.
+
+### Slash Commands (.claude/commands/)
+
+Create reusable workflows as `.md` files in `.claude/commands/`:
+
+```
+.claude/commands/
+  test.md          # "Run tests and report failures"
+  deploy.md        # "Build, lint, test, then deploy to staging"
+  review.md        # "Review staged changes for bugs and style"
 ```
 
-Run multiple agents in parallel:
+Each file is a prompt template. Users invoke them with `/project:test` in Claude Code. When probe spawns a session into this project, these commands are available.
+
+### Subagents (.claude/agents/)
+
+Define specialized agents in `.claude/agents/` for delegation:
+
+- A **code-reviewer** agent with read-only tools (`Read`, `Glob`, `Grep`)
+- A **test-runner** agent that only runs tests
+- A **doc-writer** agent for documentation tasks
+
+Agents get their own tool permissions and can be spawned via `Task` tool inside sessions.
+
+### Settings (.claude/settings.json)
+
+Project-level settings apply to every session spawned in that directory:
+
+- **Permissions**: pre-approve safe tools, deny dangerous ones
+- **Hooks**: `PreToolUse` to block dangerous patterns, `Stop` to enforce verification
+- **Model defaults**: set default model and effort level
+
+### Session Budgets
+
+Use probe flags and Claude Code flags together for cost control:
 
 ```bash
-probe new -p "Write unit tests for api.js" --cwd ./project --auto-approve
-probe new -p "Add input validation to forms.js" --cwd ./project --auto-approve
-probe sessions
+# Probe-level: cap turns and let probe enforce
+probe new -p "..." --auto-approve --max-turns 10
+
+# Claude Code-level: pass through to the subprocess
+probe new -p "..." --auto-approve -- --max-budget-usd 2.00
 ```
+
+See [references/claude-code-features.md](references/claude-code-features.md) for concrete examples of each pattern.
+
+## References
+
+Read these as needed — they're not loaded by default:
+
+- [cli-reference.md](references/cli-reference.md) — Full flag tables, HTTP API endpoints, status fields, events
+- [claude-code-features.md](references/claude-code-features.md) — Examples of CLAUDE.md, slash commands, agents, hooks, settings
+- [orchestration-patterns.md](references/orchestration-patterns.md) — Parallel sessions, resume patterns, cost tracking, failure escalation
+- [setup.md](references/setup.md) — Installation, requirements, server configuration
+
+
